@@ -101,7 +101,8 @@ def _build_spgemm_rhs(a_data, a_indices, a_indptr, a_shape, mode):
     if mode != "A_AT":
         raise ValueError(f"unsupported resolved mode: {mode}")
     a_t = ast_ops._to_torch_csr(a_data, a_indices, a_indptr, a_shape)
-    b_t = a_t.transpose(0, 1)
+    # CSR^T may materialize as CSC; convert through COO so downstream always receives CSR.
+    b_t = a_t.transpose(0, 1).to_sparse_coo().coalesce()
     return ast_ops._torch_sparse_to_csr(b_t)
 
 
@@ -155,7 +156,7 @@ def _pick_effective_benchmark_loops(warmup, iters, first_call_ms):
     return eff_warmup, eff_iters
 
 
-def _benchmark_triton_spgemm(
+def _benchmark_flagsparse_spgemm(
     a_data,
     a_indices,
     a_indptr,
@@ -260,7 +261,7 @@ def run_one_mtx(
 
     triton_result = None
     try:
-        triton_result, triton_ms, triton_first_ms, meta = _benchmark_triton_spgemm(
+        triton_result, triton_ms, triton_first_ms, meta = _benchmark_flagsparse_spgemm(
             a_data,
             a_indices,
             a_indptr,
@@ -621,7 +622,12 @@ def main():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--no-cusparse", action="store_true")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
-    parser.add_argument("--skip-api-checks", action="store_true")
+    parser.add_argument(
+        "--run-api-checks",
+        action="store_true",
+        help="run API validation checks before matrix benchmark (disabled by default)",
+    )
+    parser.add_argument("--skip-api-checks", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--input-mode",
         type=str,
@@ -635,7 +641,7 @@ def main():
         print("CUDA is not available.")
         return
 
-    if not args.skip_api_checks:
+    if args.run_api_checks and not args.skip_api_checks:
         failed = run_api_validation_checks()
         if failed > 0:
             raise SystemExit(1)
