@@ -37,6 +37,7 @@ ITERS = 50
 DEFAULT_INPUT_MODE = "auto"
 TARGET_TIMED_WINDOW_SECONDS = 8.0
 DEFAULT_REF_BLOCK_ROWS = 0  # auto
+DEFAULT_COMPARE_BLOCK_ROWS = 2048
 
 
 def _dtype_name(dtype):
@@ -183,6 +184,34 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
     return float(torch.max(diff / tol).item())
 
 
+def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
+    row_start = int(row_start)
+    row_end = int(row_end)
+    if row_end <= row_start:
+        return (
+            torch.empty(0, dtype=torch.int64, device=data.device),
+            torch.empty(0, dtype=data.dtype, device=data.device),
+        )
+    ptr = indptr[row_start:row_end + 1].to(torch.int64)
+    start = int(ptr[0].item())
+    end = int(ptr[-1].item())
+    if end <= start:
+        return (
+            torch.empty(0, dtype=torch.int64, device=data.device),
+            torch.empty(0, dtype=data.dtype, device=data.device),
+        )
+    row_counts = ptr[1:] - ptr[:-1]
+    rows = torch.repeat_interleave(
+        torch.arange(row_start, row_end, device=data.device, dtype=torch.int64),
+        row_counts,
+    )
+    cols = indices[start:end].to(torch.int64)
+    vals = data[start:end]
+    keys = rows * max(1, int(n_cols)) + cols
+    order = torch.argsort(keys)
+    return keys[order], vals[order]
+
+
 def _spgemm_compare_metrics(candidate, reference, value_dtype):
     c_data, c_indices, c_indptr, c_shape = candidate
     r_data, r_indices, r_indptr, r_shape = reference
@@ -196,28 +225,18 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
             "reason": f"shape mismatch {c_shape} vs {r_shape}",
         }
 
-    c_keys, c_vals = ast_ops._csr_to_sorted_pairs(c_data, c_indices, c_indptr, c_shape[1])
-    r_keys, r_vals = ast_ops._csr_to_sorted_pairs(r_data, r_indices, r_indptr, r_shape[1])
-    if c_keys.numel() != r_keys.numel():
+    c_nnz = int(c_indptr[-1].item()) if c_indptr.numel() > 0 else 0
+    r_nnz = int(r_indptr[-1].item()) if r_indptr.numel() > 0 else 0
+    if c_nnz != r_nnz:
         return {
             "pattern_ok": False,
             "pass": False,
             "err_ratio": float("inf"),
             "max_abs_error": float("inf"),
             "max_relative_error": float("inf"),
-            "reason": f"nnz mismatch {c_keys.numel()} vs {r_keys.numel()}",
+            "reason": f"nnz mismatch {c_nnz} vs {r_nnz}",
         }
-    if c_keys.numel() > 0 and not torch.equal(c_keys, r_keys):
-        return {
-            "pattern_ok": False,
-            "pass": False,
-            "err_ratio": float("inf"),
-            "max_abs_error": float("inf"),
-            "max_relative_error": float("inf"),
-            "reason": "sparsity pattern mismatch",
-        }
-
-    if c_vals.numel() == 0:
+    if c_nnz == 0:
         return {
             "pattern_ok": True,
             "pass": True,
@@ -228,10 +247,45 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
         }
 
     atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
-    err_ratio = _allclose_error_ratio(c_vals, r_vals, atol, rtol)
-    abs_diff = torch.abs(c_vals - r_vals)
-    max_abs = float(torch.max(abs_diff).item())
-    ref_max = float(torch.max(torch.abs(r_vals)).item())
+    n_rows = int(c_shape[0])
+    compare_rows = max(1, int(DEFAULT_COMPARE_BLOCK_ROWS))
+    err_ratio = 0.0
+    max_abs = 0.0
+    ref_max = 0.0
+    row = 0
+    while row < n_rows:
+        chunk_rows = min(compare_rows, n_rows - row)
+        while True:
+            try:
+                c_keys, c_vals = _csr_sorted_pairs_block(
+                    c_data, c_indices, c_indptr, c_shape[1], row, row + chunk_rows
+                )
+                r_keys, r_vals = _csr_sorted_pairs_block(
+                    r_data, r_indices, r_indptr, r_shape[1], row, row + chunk_rows
+                )
+                break
+            except Exception as exc:
+                if _is_resource_error(exc) and chunk_rows > 1:
+                    chunk_rows = max(1, chunk_rows // 2)
+                    continue
+                raise
+
+        if c_keys.numel() != r_keys.numel() or not torch.equal(c_keys, r_keys):
+            return {
+                "pattern_ok": False,
+                "pass": False,
+                "err_ratio": float("inf"),
+                "max_abs_error": float("inf"),
+                "max_relative_error": float("inf"),
+                "reason": f"sparsity pattern mismatch in rows [{row}, {row + chunk_rows})",
+            }
+        if c_vals.numel() > 0:
+            err_ratio = max(err_ratio, _allclose_error_ratio(c_vals, r_vals, atol, rtol))
+            abs_diff = torch.abs(c_vals - r_vals)
+            max_abs = max(max_abs, float(torch.max(abs_diff).item()))
+            ref_max = max(ref_max, float(torch.max(torch.abs(r_vals)).item()))
+        row += chunk_rows
+
     max_rel = 0.0 if ref_max == 0.0 else max_abs / ref_max
     ok = (not torch.isnan(torch.tensor(err_ratio)).item()) and err_ratio <= 1.0
     return {
@@ -566,6 +620,16 @@ def _run_reference_with_retries(
 ):
     run_direct = _build_torch_spgemm_reference if backend == "torch" else _build_cupy_spgemm_reference
     run_blocked = _build_torch_spgemm_reference_blocked if backend == "torch" else _build_cupy_spgemm_reference_blocked
+    attempted_modes = ["direct"]
+
+    def _mark_mode(mode):
+        if mode not in attempted_modes:
+            attempted_modes.append(mode)
+
+    def _finalize():
+        state["attempted_modes"] = ">".join(attempted_modes)
+        return state
+
     state = {
         "success": False,
         "result": None,
@@ -576,6 +640,7 @@ def _run_reference_with_retries(
         "peak_block_rows": None,
         "reason": None,
         "fail_stage": None,
+        "attempted_modes": "direct",
     }
     try:
         ref_result, ref_format, ref_op = run_direct(
@@ -598,7 +663,7 @@ def _run_reference_with_retries(
                 "exec_mode": "direct",
             }
         )
-        return state
+        return _finalize()
     except Exception as exc:
         state["reason"] = str(exc)
         state["fail_stage"] = "direct"
@@ -606,6 +671,8 @@ def _run_reference_with_retries(
             _cleanup_reference_pools()
 
     if blocked_retry and _is_resource_error(state["reason"]):
+        _mark_mode("blocked")
+        state["exec_mode"] = "blocked"
         for br in _candidate_block_rows(int(a_shape[0]), block_rows):
             try:
                 state["retry_count"] += 1
@@ -633,7 +700,7 @@ def _run_reference_with_retries(
                         "fail_stage": None,
                     }
                 )
-                return state
+                return _finalize()
             except Exception as blk_exc:
                 state["reason"] = str(blk_exc)
                 state["fail_stage"] = "blocked"
@@ -642,6 +709,8 @@ def _run_reference_with_retries(
                     _cleanup_reference_pools()
 
     if isolated_retry and _is_resource_error(state["reason"]):
+        _mark_mode("isolated")
+        state["exec_mode"] = "isolated"
         state["retry_count"] += 1
         iso = _run_reference_worker_subprocess(
             backend=backend,
@@ -659,7 +728,7 @@ def _run_reference_with_retries(
             if not isinstance(ref_payload, (tuple, list)) or len(ref_payload) != 4:
                 state["reason"] = "isolated worker produced invalid CSR payload"
                 state["fail_stage"] = "isolated"
-                return state
+                return _finalize()
             state.update(
                 {
                     "success": True,
@@ -677,10 +746,10 @@ def _run_reference_with_retries(
                     "fail_stage": None,
                 }
             )
-            return state
+            return _finalize()
         state["reason"] = iso.get("reason")
         state["fail_stage"] = iso.get("fail_stage", "isolated")
-    return state
+    return _finalize()
 
 
 def _pick_effective_benchmark_loops(warmup, iters, first_call_ms, target_window_seconds):
@@ -742,9 +811,10 @@ def _benchmark_flagsparse_spgemm(
     first_meta["effective_warmup"] = eff_warmup
     first_meta["effective_iters"] = eff_iters
 
+    out_buffers = (first_result[0], first_result[1], first_result[2])
     _log_stage(mtx_path, f"timed-run warmup={eff_warmup} iters={eff_iters}", start_time)
     triton_result, triton_ms = ast_ops._benchmark_cuda_op(
-        lambda: ast.flagsparse_spgemm_csr(prepared=prepared),
+        lambda: ast.flagsparse_spgemm_csr(prepared=prepared, out=out_buffers),
         warmup=eff_warmup,
         iters=eff_iters,
     )
@@ -806,6 +876,13 @@ def run_one_mtx(
         "prepare_ms": None,
         "count_ms": None,
         "fill_ms": None,
+        "bucket_nrows_short": None,
+        "bucket_nrows_medium": None,
+        "bucket_nrows_long": None,
+        "bucket_ms_short": None,
+        "bucket_ms_medium": None,
+        "bucket_ms_long": None,
+        "long_row_sliced_count": None,
         "effective_warmup": None,
         "effective_iters": None,
         "pytorch_ms": None,
@@ -823,6 +900,9 @@ def run_one_mtx(
         "pytorch_format": None,
         "pt_exec_mode": None,
         "cu_exec_mode": None,
+        "attempted_modes_pt": None,
+        "attempted_modes_cu": None,
+        "compare_status": "OK",
         "pt_retry_count": 0,
         "cu_retry_count": 0,
         "ref_peak_block_rows": None,
@@ -854,17 +934,28 @@ def run_one_mtx(
         result["prepare_ms"] = meta.get("prepare_ms")
         result["count_ms"] = meta.get("count_ms")
         result["fill_ms"] = meta.get("fill_ms")
+        result["bucket_nrows_short"] = meta.get("bucket_nrows_short")
+        result["bucket_nrows_medium"] = meta.get("bucket_nrows_medium")
+        result["bucket_nrows_long"] = meta.get("bucket_nrows_long")
+        result["bucket_ms_short"] = meta.get("bucket_ms_short")
+        result["bucket_ms_medium"] = meta.get("bucket_ms_medium")
+        result["bucket_ms_long"] = meta.get("bucket_ms_long")
+        result["long_row_sliced_count"] = meta.get("long_row_sliced_count")
         result["effective_warmup"] = meta.get("effective_warmup")
         result["effective_iters"] = meta.get("effective_iters")
         result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
     except Exception as exc:
         result["error"] = _append_error(result["error"], f"triton: {exc}")
 
+    if ref_cleanup:
+        _cleanup_reference_pools()
     _log_stage(mtx_path, "reference", case_start)
     result["ref_started"] = True
     ref_result = None
     pt_compared = False
     cu_compared = False
+    pt_ref_success = False
+    cu_ref_success = False
     ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
     ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
     ref_warmup = max(0, int(ref_warmup))
@@ -891,22 +982,32 @@ def run_one_mtx(
         input_mode=input_mode,
     )
     result["pt_exec_mode"] = pt_ref.get("exec_mode")
+    result["attempted_modes_pt"] = pt_ref.get("attempted_modes")
     result["pt_retry_count"] = int(pt_ref.get("retry_count", 0))
     if pt_ref.get("peak_block_rows") is not None:
         result["ref_peak_block_rows"] = int(pt_ref["peak_block_rows"])
     if pt_ref.get("success"):
+        pt_ref_success = True
         ref_result = pt_ref.get("result")
         result["pytorch_format"] = pt_ref.get("format")
         result["pytorch_ms"] = pt_ref.get("ms")
         if triton_result is not None and ref_result is not None:
-            pt_metrics = _spgemm_compare_metrics(triton_result, ref_result, value_dtype)
-            result["triton_ok_pt"] = pt_metrics["pass"]
-            result["err_pt"] = pt_metrics["err_ratio"]
-            result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
-            result["max_rel_err_pt"] = pt_metrics["max_relative_error"]
-            if not pt_metrics["pattern_ok"]:
-                result["error"] = _append_error(result["error"], f"pt_ref: {pt_metrics['reason']}")
-            pt_compared = True
+            try:
+                pt_metrics = _spgemm_compare_metrics(triton_result, ref_result, value_dtype)
+                result["triton_ok_pt"] = pt_metrics["pass"]
+                result["err_pt"] = pt_metrics["err_ratio"]
+                result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
+                result["max_rel_err_pt"] = pt_metrics["max_relative_error"]
+                if not pt_metrics["pattern_ok"]:
+                    result["error"] = _append_error(result["error"], f"pt_ref: {pt_metrics['reason']}")
+                pt_compared = True
+            except Exception as cmp_exc:
+                cmp_msg = str(cmp_exc)
+                result["error"] = _append_error(result["error"], f"pt_compare: {cmp_msg}")
+                if _is_resource_error(cmp_msg):
+                    result["compare_status"] = "COMPARE_OOM"
+                elif result.get("compare_status") == "OK":
+                    result["compare_status"] = "COMPARE_FAIL"
     else:
         result["pytorch_reason"] = pt_ref.get("reason")
         result["ref_fail_stage"] = pt_ref.get("fail_stage")
@@ -934,22 +1035,32 @@ def run_one_mtx(
             input_mode=input_mode,
         )
         result["cu_exec_mode"] = cu_ref.get("exec_mode")
+        result["attempted_modes_cu"] = cu_ref.get("attempted_modes")
         result["cu_retry_count"] = int(cu_ref.get("retry_count", 0))
         if cu_ref.get("peak_block_rows") is not None:
             cur_peak = result.get("ref_peak_block_rows")
             result["ref_peak_block_rows"] = int(cu_ref["peak_block_rows"]) if cur_peak is None else max(int(cur_peak), int(cu_ref["peak_block_rows"]))
         if cu_ref.get("success"):
+            cu_ref_success = True
             result["cusparse_ms"] = cu_ref.get("ms")
             c_ref = cu_ref.get("result")
             if triton_result is not None and c_ref is not None:
-                cu_metrics = _spgemm_compare_metrics(triton_result, c_ref, value_dtype)
-                result["triton_ok_cu"] = cu_metrics["pass"]
-                result["err_cu"] = cu_metrics["err_ratio"]
-                result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
-                result["max_rel_err_cu"] = cu_metrics["max_relative_error"]
-                if not cu_metrics["pattern_ok"]:
-                    result["error"] = _append_error(result["error"], f"cu_ref: {cu_metrics['reason']}")
-                cu_compared = True
+                try:
+                    cu_metrics = _spgemm_compare_metrics(triton_result, c_ref, value_dtype)
+                    result["triton_ok_cu"] = cu_metrics["pass"]
+                    result["err_cu"] = cu_metrics["err_ratio"]
+                    result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
+                    result["max_rel_err_cu"] = cu_metrics["max_relative_error"]
+                    if not cu_metrics["pattern_ok"]:
+                        result["error"] = _append_error(result["error"], f"cu_ref: {cu_metrics['reason']}")
+                    cu_compared = True
+                except Exception as cmp_exc:
+                    cmp_msg = str(cmp_exc)
+                    result["error"] = _append_error(result["error"], f"cu_compare: {cmp_msg}")
+                    if _is_resource_error(cmp_msg):
+                        result["compare_status"] = "COMPARE_OOM"
+                    elif result.get("compare_status") == "OK":
+                        result["compare_status"] = "COMPARE_FAIL"
         else:
             result["cusparse_reason"] = cu_ref.get("reason")
             if result.get("ref_fail_stage") is None:
@@ -958,6 +1069,7 @@ def run_one_mtx(
     else:
         result["cusparse_reason"] = "CuPy/cuSPARSE reference is disabled"
         result["cu_exec_mode"] = "disabled"
+        result["attempted_modes_cu"] = "disabled"
 
     _log_stage(mtx_path, "compare", case_start)
     if triton_result is None:
@@ -974,12 +1086,17 @@ def run_one_mtx(
     if pt_compared or cu_compared:
         result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
     else:
-        ref_code = _classify_reference_reason(
-            result.get("pytorch_reason"),
-            result.get("cusparse_reason"),
-        )
-        result["ref_reason_code"] = ref_code
-        result["status"] = ref_code
+        had_ref_success = pt_ref_success or cu_ref_success
+        if had_ref_success and result.get("compare_status") != "OK":
+            result["status"] = "FAIL"
+            result["ref_reason_code"] = result.get("compare_status")
+        else:
+            ref_code = _classify_reference_reason(
+                result.get("pytorch_reason"),
+                result.get("cusparse_reason"),
+            )
+            result["ref_reason_code"] = ref_code
+            result["status"] = ref_code
     if ref_cleanup:
         _cleanup_reference_pools()
     return result
@@ -1077,7 +1194,30 @@ def _print_spgemm_mtx_row(entry):
             f"  REF: pt_mode={pt_mode or 'N/A'} cu_mode={cu_mode or 'N/A'} "
             f"pt_retry={pt_retry} cu_retry={cu_retry} "
             f"peak_block_rows={peak_rows if peak_rows is not None else 'N/A'} "
-            f"fail_stage={fail_stage or 'N/A'}"
+            f"fail_stage={fail_stage or 'N/A'} "
+            f"pt_attempted={entry.get('attempted_modes_pt') or 'N/A'} "
+            f"cu_attempted={entry.get('attempted_modes_cu') or 'N/A'}"
+        )
+    if entry.get("compare_status") not in (None, "OK"):
+        print(f"  COMPARE: {entry.get('compare_status')}")
+    b_rows = (
+        entry.get("bucket_nrows_short"),
+        entry.get("bucket_nrows_medium"),
+        entry.get("bucket_nrows_long"),
+    )
+    b_ms = (
+        entry.get("bucket_ms_short"),
+        entry.get("bucket_ms_medium"),
+        entry.get("bucket_ms_long"),
+    )
+    if any(v is not None for v in (*b_rows, *b_ms, (entry.get("long_row_sliced_count")))):
+        print(
+            "  PERF: "
+            f"bucket_nrows(s/m/l)={b_rows[0] if b_rows[0] is not None else 'N/A'}/"
+            f"{b_rows[1] if b_rows[1] is not None else 'N/A'}/"
+            f"{b_rows[2] if b_rows[2] is not None else 'N/A'} "
+            f"bucket_ms(s/m/l)={_fmt_ms(b_ms[0])}/{_fmt_ms(b_ms[1])}/{_fmt_ms(b_ms[2])} "
+            f"long_row_sliced={entry.get('long_row_sliced_count') if entry.get('long_row_sliced_count') is not None else 'N/A'}"
         )
 
 
@@ -1153,6 +1293,9 @@ def run_all_dtypes_export_csv(
                         "error": entry.get("error"),
                         "pt_exec_mode": entry.get("pt_exec_mode"),
                         "cu_exec_mode": entry.get("cu_exec_mode"),
+                        "attempted_modes_pt": entry.get("attempted_modes_pt"),
+                        "attempted_modes_cu": entry.get("attempted_modes_cu"),
+                        "compare_status": entry.get("compare_status"),
                         "pt_retry_count": entry.get("pt_retry_count"),
                         "cu_retry_count": entry.get("cu_retry_count"),
                         "ref_peak_block_rows": entry.get("ref_peak_block_rows"),
@@ -1166,6 +1309,13 @@ def run_all_dtypes_export_csv(
                         "prepare_ms": entry.get("prepare_ms"),
                         "count_ms": entry.get("count_ms"),
                         "fill_ms": entry.get("fill_ms"),
+                        "bucket_nrows_short": entry.get("bucket_nrows_short"),
+                        "bucket_nrows_medium": entry.get("bucket_nrows_medium"),
+                        "bucket_nrows_long": entry.get("bucket_nrows_long"),
+                        "bucket_ms_short": entry.get("bucket_ms_short"),
+                        "bucket_ms_medium": entry.get("bucket_ms_medium"),
+                        "bucket_ms_long": entry.get("bucket_ms_long"),
+                        "long_row_sliced_count": entry.get("long_row_sliced_count"),
                         "triton_started": entry.get("triton_started"),
                         "ref_started": entry.get("ref_started"),
                         "effective_warmup": entry.get("effective_warmup"),
@@ -1178,10 +1328,15 @@ def run_all_dtypes_export_csv(
         "pt_status", "cu_status", "status", "ref_reason_code", "err_pt", "err_cu",
         "max_abs_err_pt", "max_rel_err_pt", "max_abs_err_cu", "max_rel_err_cu",
         "pytorch_reason", "cusparse_reason", "error",
-        "pt_exec_mode", "cu_exec_mode", "pt_retry_count", "cu_retry_count",
+        "pt_exec_mode", "cu_exec_mode", "attempted_modes_pt", "attempted_modes_cu",
+        "compare_status", "pt_retry_count", "cu_retry_count",
         "ref_peak_block_rows", "ref_fail_stage",
         "nnz_a", "nnz_b", "nnz_c", "input_mode", "shape_a", "shape_b",
-        "prepare_ms", "count_ms", "fill_ms", "triton_started", "ref_started",
+        "prepare_ms", "count_ms", "fill_ms",
+        "bucket_nrows_short", "bucket_nrows_medium", "bucket_nrows_long",
+        "bucket_ms_short", "bucket_ms_medium", "bucket_ms_long",
+        "long_row_sliced_count",
+        "triton_started", "ref_started",
         "effective_warmup", "effective_iters",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:

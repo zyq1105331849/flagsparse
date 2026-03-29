@@ -3,6 +3,7 @@
 from ._common import *
 
 SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
+SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS = ("baseline", "acc64", "altreduce")
 
 
 class SDDMMPrepared:
@@ -149,6 +150,58 @@ def _sddmm_csr_real_kernel(
     tl.store(out_ptr + offs_p, out_vals, mask=mask_p)
 
 
+@triton.jit
+def _sddmm_csr_real_kernel_altreduce(
+    indices_ptr,
+    row_ids_ptr,
+    x_ptr,
+    y_ptr,
+    in_ptr,
+    out_ptr,
+    nnz,
+    k_dim,
+    stride_xm,
+    stride_xk,
+    stride_ym,
+    stride_yk,
+    alpha,
+    beta,
+    HAS_IN: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_p = pid * BLOCK_P + tl.arange(0, BLOCK_P)
+    mask_p = offs_p < nnz
+
+    rows = tl.load(row_ids_ptr + offs_p, mask=mask_p, other=0)
+    cols = tl.load(indices_ptr + offs_p, mask=mask_p, other=0)
+    acc = tl.zeros([BLOCK_P], dtype=ACC_DTYPE)
+
+    for k0 in tl.range(0, k_dim, BLOCK_K):
+        for kk in tl.static_range(0, BLOCK_K):
+            k_idx = k0 + kk
+            valid_k = k_idx < k_dim
+            x_vals = tl.load(
+                x_ptr + rows * stride_xm + k_idx * stride_xk,
+                mask=mask_p & valid_k,
+                other=0.0,
+            )
+            y_vals = tl.load(
+                y_ptr + cols * stride_ym + k_idx * stride_yk,
+                mask=mask_p & valid_k,
+                other=0.0,
+            )
+            acc += x_vals.to(ACC_DTYPE) * y_vals.to(ACC_DTYPE)
+
+    out_vals = acc * alpha
+    if HAS_IN:
+        in_vals = tl.load(in_ptr + offs_p, mask=mask_p, other=0.0).to(ACC_DTYPE)
+        out_vals += in_vals * beta
+    tl.store(out_ptr + offs_p, out_vals, mask=mask_p)
+
+
 def _validate_sddmm_dense_inputs(data, prepared, x, y):
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError("x and y must be 2D dense tensors")
@@ -186,7 +239,28 @@ def _prepare_validated_sddmm_out(prepared, x, out):
     return out
 
 
-def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=False):
+def _normalize_sddmm_diagnostic_variant(variant):
+    if variant is None:
+        return "baseline"
+    variant = str(variant).strip().lower()
+    if variant not in SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS:
+        supported = ", ".join(SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS)
+        raise ValueError(f"Unsupported SDDMM diagnostic variant {variant!r}; expected one of: {supported}")
+    return variant
+
+
+def _resolve_sddmm_diagnostic_kernel(variant, value_dtype):
+    variant = _normalize_sddmm_diagnostic_variant(variant)
+    if variant == "baseline":
+        acc_dtype = tl.float64 if value_dtype == torch.float64 else tl.float32
+        return _sddmm_csr_real_kernel, acc_dtype
+    if variant == "acc64":
+        return _sddmm_csr_real_kernel, tl.float64
+    acc_dtype = tl.float64 if value_dtype == torch.float64 else tl.float32
+    return _sddmm_csr_real_kernel_altreduce, acc_dtype
+
+
+def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=False, variant="baseline"):
     nnz = prepared.nnz
     out = _prepare_validated_sddmm_out(prepared, x, out)
     if nnz == 0:
@@ -194,17 +268,19 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=F
             "block_k": prepared.block_k,
             "num_warps": prepared.num_warps,
             "fallback_used": False,
+            "variant": _normalize_sddmm_diagnostic_variant(variant),
         }
 
     k_dim = int(x.shape[1])
     block_k, num_warps = _resolve_sddmm_launch_config(k_dim)
     block_p = 128
-    acc_dtype = tl.float64 if x.dtype == torch.float64 else tl.float32
+    kernel, acc_dtype = _resolve_sddmm_diagnostic_kernel(variant, x.dtype)
+    variant = _normalize_sddmm_diagnostic_variant(variant)
     grid = (triton.cdiv(nnz, block_p),)
     fallback_used = False
     if allow_fallback:
         try:
-            _sddmm_csr_real_kernel[grid](
+            kernel[grid](
                 prepared.indices,
                 prepared.row_ids,
                 x,
@@ -229,7 +305,7 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=F
             out.copy_(_sddmm_reference(prepared.indices, prepared.indptr, x, y, data, alpha, beta))
             fallback_used = True
     else:
-        _sddmm_csr_real_kernel[grid](
+        kernel[grid](
             prepared.indices,
             prepared.row_ids,
             x,
@@ -250,7 +326,13 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=F
             ACC_DTYPE=acc_dtype,
             num_warps=num_warps,
         )
-    return out, {"block_k": block_k, "num_warps": num_warps, "fallback_used": fallback_used}
+    return out, {
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "fallback_used": fallback_used,
+        "variant": variant,
+        "acc_dtype": "float64" if acc_dtype == tl.float64 else "float32",
+    }
 
 
 def flagsparse_sddmm_csr(
