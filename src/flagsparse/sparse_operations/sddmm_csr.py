@@ -186,18 +186,49 @@ def _prepare_validated_sddmm_out(prepared, x, out):
     return out
 
 
-def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out):
+def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=False):
     nnz = prepared.nnz
     out = _prepare_validated_sddmm_out(prepared, x, out)
     if nnz == 0:
-        return out, {"block_k": prepared.block_k, "num_warps": prepared.num_warps}
+        return out, {
+            "block_k": prepared.block_k,
+            "num_warps": prepared.num_warps,
+            "fallback_used": False,
+        }
 
     k_dim = int(x.shape[1])
     block_k, num_warps = _resolve_sddmm_launch_config(k_dim)
     block_p = 128
     acc_dtype = tl.float64 if x.dtype == torch.float64 else tl.float32
     grid = (triton.cdiv(nnz, block_p),)
-    try:
+    fallback_used = False
+    if allow_fallback:
+        try:
+            _sddmm_csr_real_kernel[grid](
+                prepared.indices,
+                prepared.row_ids,
+                x,
+                y,
+                data if data is not None else out,
+                out,
+                nnz,
+                k_dim,
+                x.stride(0),
+                x.stride(1),
+                y.stride(0),
+                y.stride(1),
+                float(alpha),
+                float(beta),
+                HAS_IN=data is not None,
+                BLOCK_P=block_p,
+                BLOCK_K=block_k,
+                ACC_DTYPE=acc_dtype,
+                num_warps=num_warps,
+            )
+        except Exception:
+            out.copy_(_sddmm_reference(prepared.indices, prepared.indptr, x, y, data, alpha, beta))
+            fallback_used = True
+    else:
         _sddmm_csr_real_kernel[grid](
             prepared.indices,
             prepared.row_ids,
@@ -219,10 +250,7 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out):
             ACC_DTYPE=acc_dtype,
             num_warps=num_warps,
         )
-    except Exception:
-        # Safe fallback when Triton codegen/runtime is unavailable.
-        out.copy_(_sddmm_reference(prepared.indices, prepared.indptr, x, y, data, alpha, beta))
-    return out, {"block_k": block_k, "num_warps": num_warps}
+    return out, {"block_k": block_k, "num_warps": num_warps, "fallback_used": fallback_used}
 
 
 def flagsparse_sddmm_csr(
@@ -238,6 +266,7 @@ def flagsparse_sddmm_csr(
     out=None,
     return_time=False,
     return_meta=False,
+    allow_fallback=False,
 ):
     """CSR SDDMM: out[p] = alpha * dot(x[row(p)], y[col(p)]) + beta * data[p]."""
     prepare_ms = 0.0
@@ -264,17 +293,27 @@ def flagsparse_sddmm_csr(
             out.zero_()
         else:
             out.copy_(data * beta)
+        meta = {"prepare_ms": prepare_ms, "block_k": prepared.block_k, "num_warps": prepared.num_warps, "fallback_used": False}
         if return_time and return_meta:
-            return out, 0.0, {"prepare_ms": prepare_ms, "block_k": prepared.block_k, "num_warps": prepared.num_warps}
+            return out, 0.0, meta
         if return_time:
             return out, 0.0
         if return_meta:
-            return out, {"prepare_ms": prepare_ms, "block_k": prepared.block_k, "num_warps": prepared.num_warps}
+            return out, meta
         return out
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    out_tensor, launch_meta = _run_sddmm_prepared(prepared, x.contiguous(), y.contiguous(), data.contiguous() if data is not None else None, alpha, beta, out)
+    out_tensor, launch_meta = _run_sddmm_prepared(
+        prepared,
+        x.contiguous(),
+        y.contiguous(),
+        data.contiguous() if data is not None else None,
+        alpha,
+        beta,
+        out,
+        allow_fallback=allow_fallback,
+    )
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -304,6 +343,38 @@ def _sddmm_reference(indices, indptr, x, y, data, alpha, beta):
     return vals
 
 
+def _cupy_sampled_dot_reference(indices, indptr, x, y, data, alpha, beta, chunk_nnz=262144):
+    _require_cupy()
+    n_rows = int(indptr.numel()) - 1
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, dtype=torch.int64, device=indices.device),
+        indptr[1:] - indptr[:-1],
+    )
+    row_ids_cp = _cupy_from_torch(row_ids)
+    col_ids_cp = _cupy_from_torch(indices.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    y_cp = _cupy_from_torch(y)
+    nnz = int(indices.numel())
+    if nnz == 0:
+        vals = torch.empty(0, dtype=x.dtype, device=x.device)
+        if data is not None and beta != 0.0:
+            vals = vals + data * beta
+        return vals
+
+    out_cp = cp.empty((nnz,), dtype=x_cp.dtype)
+    chunk_nnz = max(1, int(chunk_nnz))
+    for start in range(0, nnz, chunk_nnz):
+        end = min(nnz, start + chunk_nnz)
+        rows = row_ids_cp[start:end]
+        cols = col_ids_cp[start:end]
+        out_cp[start:end] = cp.sum(x_cp[rows] * y_cp[cols], axis=1)
+    out = _torch_from_cupy(out_cp)
+    out = out * alpha
+    if data is not None and beta != 0.0:
+        out = out + data * beta
+    return out
+
+
 def benchmark_sddmm_case(
     n_rows=1024,
     n_cols=1024,
@@ -316,7 +387,7 @@ def benchmark_sddmm_case(
     beta=0.0,
     run_cusparse=False,
 ):
-    """Benchmark SDDMM and compare with dense-gather reference."""
+    """Benchmark SDDMM and compare with sampled-dot reference."""
     if value_dtype not in SUPPORTED_SDDMM_VALUE_DTYPES:
         raise TypeError("value_dtype must be torch.float32 or torch.float64")
     device = torch.device("cuda")
@@ -356,16 +427,19 @@ def benchmark_sddmm_case(
             cusparse_reason = "CuPy is not available"
         else:
             try:
-                x_cp = _cupy_from_torch(x)
-                y_cp = _cupy_from_torch(y)
-                dense_cp, cusparse_ms = _benchmark_cuda_op(lambda: x_cp @ y_cp.T, warmup=warmup, iters=iters)
-                dense_t = _torch_from_cupy(dense_cp)
-                row_ids = _build_row_ids(indptr.to(torch.int64)).to(torch.int64)
-                ref_cu = dense_t[row_ids, indices.to(torch.int64)]
-                if beta != 0.0:
-                    ref_cu = ref_cu * alpha + data * beta
-                else:
-                    ref_cu = ref_cu * alpha
+                ref_cu, cusparse_ms = _benchmark_cuda_op(
+                    lambda: _cupy_sampled_dot_reference(
+                        indices=indices,
+                        indptr=indptr.to(torch.int64),
+                        x=x,
+                        y=y,
+                        data=data,
+                        alpha=alpha,
+                        beta=beta,
+                    ),
+                    warmup=warmup,
+                    iters=iters,
+                )
                 cusparse_match = bool(torch.allclose(triton_values, ref_cu, atol=atol, rtol=rtol))
             except Exception as exc:
                 cusparse_reason = str(exc)

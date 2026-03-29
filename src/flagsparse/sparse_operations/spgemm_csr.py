@@ -3,6 +3,9 @@
 from ._common import *
 
 SUPPORTED_SPGEMM_VALUE_DTYPES = (torch.float32, torch.float64)
+_SPGEMM_COUNT_MAX_EXPANDED = 2_000_000
+_SPGEMM_FILL_MAX_EXPANDED = 1_200_000
+_SPGEMM_MAX_ROWS_PER_CHUNK = 4096
 
 
 class SpGEMMPrepared:
@@ -22,6 +25,9 @@ class SpGEMMPrepared:
         "n_cols",
         "a_row_work",
         "row_bucket",
+        "row_work_ready",
+        "count_chunks",
+        "fill_chunks",
         "hash_capacity_hint",
         "block_nnz",
     )
@@ -38,6 +44,9 @@ class SpGEMMPrepared:
         b_shape,
         a_row_work,
         row_bucket,
+        row_work_ready,
+        count_chunks,
+        fill_chunks,
         hash_capacity_hint,
         block_nnz,
     ):
@@ -54,6 +63,9 @@ class SpGEMMPrepared:
         self.n_cols = self.b_shape[1]
         self.a_row_work = a_row_work
         self.row_bucket = row_bucket
+        self.row_work_ready = bool(row_work_ready)
+        self.count_chunks = count_chunks
+        self.fill_chunks = fill_chunks
         self.hash_capacity_hint = int(hash_capacity_hint)
         self.block_nnz = int(block_nnz)
 
@@ -192,6 +204,7 @@ def prepare_spgemm_csr(
     b_indptr,
     b_shape,
     block_nnz=256,
+    analyze_rows=True,
 ):
     if block_nnz <= 0:
         raise ValueError("block_nnz must be positive")
@@ -217,7 +230,10 @@ def prepare_spgemm_csr(
     n_rows = int(a_shape[0])
     if n_rows == 0:
         row_work = torch.empty(0, dtype=torch.int32, device=a_data.device)
-    else:
+        row_bucket = torch.empty(0, dtype=torch.int8, device=a_data.device)
+        hash_capacity_hint = 256
+        row_work_ready = True
+    elif analyze_rows:
         row_work = torch.empty(n_rows, dtype=torch.int32, device=a_data.device)
         try:
             _spgemm_row_work_kernel[(n_rows,)](
@@ -238,8 +254,14 @@ def prepare_spgemm_csr(
                     continue
                 cols = a_indices[start:end].to(torch.int64)
                 row_work[row] = torch.sum(b_row_nnz[cols]).to(torch.int32)
-    row_bucket = _build_row_bucket(row_work)
-    hash_capacity_hint = _estimate_hash_capacity(row_work)
+        row_bucket = _build_row_bucket(row_work)
+        hash_capacity_hint = _estimate_hash_capacity(row_work)
+        row_work_ready = True
+    else:
+        row_work = torch.zeros(n_rows, dtype=torch.int32, device=a_data.device)
+        row_bucket = torch.zeros(n_rows, dtype=torch.int8, device=a_data.device)
+        hash_capacity_hint = 256
+        row_work_ready = False
     return SpGEMMPrepared(
         a_data=a_data,
         a_indices=a_indices,
@@ -251,51 +273,152 @@ def prepare_spgemm_csr(
         b_shape=b_shape,
         a_row_work=row_work,
         row_bucket=row_bucket,
+        row_work_ready=row_work_ready,
+        count_chunks=(
+            _build_row_chunks(row_work, _SPGEMM_COUNT_MAX_EXPANDED, _SPGEMM_MAX_ROWS_PER_CHUNK)
+            if row_work_ready
+            else None
+        ),
+        fill_chunks=(
+            _build_row_chunks(row_work, _SPGEMM_FILL_MAX_EXPANDED, _SPGEMM_MAX_ROWS_PER_CHUNK)
+            if row_work_ready
+            else None
+        ),
         hash_capacity_hint=hash_capacity_hint,
         block_nnz=block_nnz,
     )
 
 
-def _expand_b_positions_for_a_row(a_cols_i32, b_indptr_i64, device):
-    if a_cols_i32.numel() == 0:
-        empty = torch.empty(0, dtype=torch.int64, device=device)
-        return empty, empty, empty
-    a_cols_i64 = a_cols_i32.to(torch.int64)
-    starts = b_indptr_i64[a_cols_i64]
-    ends = b_indptr_i64[a_cols_i64 + 1]
-    counts = ends - starts
-    total = int(counts.sum().item())
-    if total == 0:
-        empty = torch.empty(0, dtype=torch.int64, device=device)
-        return empty, empty, empty
-    owner = torch.repeat_interleave(
-        torch.arange(a_cols_i64.numel(), device=device, dtype=torch.int64), counts
+def _ensure_row_work(prepared):
+    if prepared.row_work_ready:
+        return
+    if prepared.a_data.numel() == 0 or prepared.b_data.numel() == 0:
+        prepared.a_row_work = torch.zeros(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
+        prepared.row_bucket = torch.zeros(prepared.n_rows, dtype=torch.int8, device=prepared.a_data.device)
+        prepared.hash_capacity_hint = 256
+        prepared.row_work_ready = True
+        _refresh_row_chunks(prepared)
+        return
+    row_work = torch.empty(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
+    _spgemm_row_work_kernel[(prepared.n_rows,)](
+        prepared.a_indptr,
+        prepared.a_indices,
+        prepared.b_indptr,
+        row_work,
+        prepared.n_rows,
+        BLOCK_NNZ=int(prepared.block_nnz),
     )
-    prefix = torch.cumsum(counts, dim=0)
-    base = prefix - counts
-    repeated_starts = torch.repeat_interleave(starts, counts)
-    intra = torch.arange(total, device=device, dtype=torch.int64) - torch.repeat_interleave(base, counts)
-    b_pos = repeated_starts + intra
-    return b_pos, owner, counts
+    prepared.a_row_work = row_work
+    prepared.row_bucket = _build_row_bucket(row_work)
+    prepared.hash_capacity_hint = _estimate_hash_capacity(row_work)
+    prepared.row_work_ready = True
+    _refresh_row_chunks(prepared)
+
+
+def _build_row_chunks(row_work, max_expanded, max_rows_per_chunk):
+    n_rows = int(row_work.numel())
+    if n_rows == 0:
+        return []
+    work_host = row_work.detach().to("cpu", dtype=torch.int64).tolist()
+    chunks = []
+    row = 0
+    while row < n_rows:
+        start = row
+        acc = 0
+        taken = 0
+        while row < n_rows and taken < max_rows_per_chunk:
+            w = int(work_host[row])
+            if taken > 0 and acc + w > max_expanded:
+                break
+            acc += w
+            row += 1
+            taken += 1
+            if taken == 1 and w > max_expanded:
+                break
+        if row == start:
+            row += 1
+        chunks.append((start, row))
+    return chunks
+
+
+def _refresh_row_chunks(prepared):
+    prepared.count_chunks = _build_row_chunks(
+        prepared.a_row_work,
+        max_expanded=_SPGEMM_COUNT_MAX_EXPANDED,
+        max_rows_per_chunk=_SPGEMM_MAX_ROWS_PER_CHUNK,
+    )
+    prepared.fill_chunks = _build_row_chunks(
+        prepared.a_row_work,
+        max_expanded=_SPGEMM_FILL_MAX_EXPANDED,
+        max_rows_per_chunk=_SPGEMM_MAX_ROWS_PER_CHUNK,
+    )
+
+
+def _expand_chunk_contrib(prepared, row_start, row_end, need_values):
+    device = prepared.a_data.device
+    a_ptr_start = int(prepared.a_indptr[row_start].item())
+    a_ptr_end = int(prepared.a_indptr[row_end].item())
+    if a_ptr_end <= a_ptr_start:
+        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
+        if need_values:
+            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
+            return empty_i64, empty_v
+        return empty_i64, None
+
+    row_nnz = (prepared.a_indptr[row_start + 1:row_end + 1] - prepared.a_indptr[row_start:row_end]).to(torch.int64)
+    rows = torch.repeat_interleave(
+        torch.arange(row_start, row_end, device=device, dtype=torch.int64),
+        row_nnz,
+    )
+    a_cols = prepared.a_indices[a_ptr_start:a_ptr_end].to(torch.int64)
+    b_starts = prepared.b_indptr[a_cols]
+    b_ends = prepared.b_indptr[a_cols + 1]
+    b_counts = b_ends - b_starts
+    total = int(b_counts.sum().item())
+    if total == 0:
+        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
+        if need_values:
+            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
+            return empty_i64, empty_v
+        return empty_i64, None
+
+    owner = torch.repeat_interleave(
+        torch.arange(a_cols.numel(), device=device, dtype=torch.int64),
+        b_counts,
+    )
+    rows_expanded = rows[owner]
+    prefix = torch.cumsum(b_counts, dim=0)
+    base = prefix - b_counts
+    starts_rep = torch.repeat_interleave(b_starts, b_counts)
+    intra = (
+        torch.arange(total, device=device, dtype=torch.int64)
+        - torch.repeat_interleave(base, b_counts)
+    )
+    b_pos = starts_rep + intra
+    cols = prepared.b_indices[b_pos].to(torch.int64)
+    keys = rows_expanded * max(1, prepared.n_cols) + cols
+    if not need_values:
+        return keys, None
+
+    a_vals = prepared.a_data[a_ptr_start:a_ptr_end]
+    vals = a_vals[owner] * prepared.b_data[b_pos]
+    return keys, vals
 
 
 def _spgemm_count_phase(prepared):
     n_rows = prepared.n_rows
     device = prepared.a_data.device
     row_nnz_c = torch.zeros(n_rows, dtype=torch.int64, device=device)
-    for row in range(n_rows):
-        start = int(prepared.a_indptr[row].item())
-        end = int(prepared.a_indptr[row + 1].item())
-        if end <= start:
+    if prepared.count_chunks is None:
+        _refresh_row_chunks(prepared)
+    for row_start, row_end in prepared.count_chunks:
+        keys, _ = _expand_chunk_contrib(prepared, row_start, row_end, need_values=False)
+        if keys.numel() == 0:
             continue
-        a_cols = prepared.a_indices[start:end]
-        b_pos, _, _ = _expand_b_positions_for_a_row(
-            a_cols, prepared.b_indptr, device=device
-        )
-        if b_pos.numel() == 0:
-            continue
-        cols = prepared.b_indices[b_pos]
-        row_nnz_c[row] = torch.unique(cols, sorted=True).numel()
+        uniq_keys = torch.unique(keys, sorted=True)
+        uniq_rows = torch.div(uniq_keys, max(1, prepared.n_cols), rounding_mode="floor")
+        counts = torch.bincount((uniq_rows - row_start).to(torch.int64), minlength=row_end - row_start)
+        row_nnz_c[row_start:row_end] = counts
     return row_nnz_c
 
 
@@ -307,37 +430,45 @@ def _spgemm_fill_phase(prepared, c_indptr):
     if nnz_c == 0:
         return c_data, c_indices
 
-    for row in range(prepared.n_rows):
-        out_start = int(c_indptr[row].item())
-        out_end = int(c_indptr[row + 1].item())
-        if out_end <= out_start:
+    if prepared.fill_chunks is None:
+        _refresh_row_chunks(prepared)
+    for row_start, row_end in prepared.fill_chunks:
+        keys, vals = _expand_chunk_contrib(prepared, row_start, row_end, need_values=True)
+        if keys.numel() == 0:
             continue
-        start = int(prepared.a_indptr[row].item())
-        end = int(prepared.a_indptr[row + 1].item())
-        if end <= start:
+        order = torch.argsort(keys)
+        keys_sorted = keys[order]
+        vals_sorted = vals[order]
+
+        head = torch.ones(keys_sorted.numel(), dtype=torch.bool, device=device)
+        if keys_sorted.numel() > 1:
+            head[1:] = keys_sorted[1:] != keys_sorted[:-1]
+        uniq_keys = keys_sorted[head]
+        if uniq_keys.numel() == 0:
             continue
-        a_cols = prepared.a_indices[start:end]
-        a_vals = prepared.a_data[start:end]
-        b_pos, owner, _ = _expand_b_positions_for_a_row(
-            a_cols, prepared.b_indptr, device=device
-        )
-        if b_pos.numel() == 0:
-            c_indices[out_start:out_end] = 0
-            c_data[out_start:out_end] = 0
-            continue
-        cols = prepared.b_indices[b_pos]
-        b_vals = prepared.b_data[b_pos]
-        contrib = a_vals[owner] * b_vals
-        uniq_cols, inv = torch.unique(cols, sorted=True, return_inverse=True)
-        vals = torch.zeros(uniq_cols.numel(), dtype=prepared.a_data.dtype, device=device)
-        vals.scatter_add_(0, inv, contrib)
-        c_indices[out_start:out_end] = uniq_cols
-        c_data[out_start:out_end] = vals
+        seg_id = torch.cumsum(head.to(torch.int64), dim=0) - 1
+        uniq_vals = torch.zeros(uniq_keys.numel(), dtype=prepared.a_data.dtype, device=device)
+        uniq_vals.scatter_add_(0, seg_id, vals_sorted)
+
+        uniq_rows = torch.div(uniq_keys, max(1, prepared.n_cols), rounding_mode="floor")
+        uniq_cols = (uniq_keys - uniq_rows * max(1, prepared.n_cols)).to(torch.int32)
+        uniq_rows_rel = (uniq_rows - row_start).to(torch.int64)
+
+        per_row = torch.bincount(uniq_rows_rel, minlength=row_end - row_start)
+        row_local = torch.zeros(row_end - row_start + 1, dtype=torch.int64, device=device)
+        row_local[1:] = torch.cumsum(per_row, dim=0)
+        row_local_start = row_local[:-1]
+        local_pos = torch.arange(uniq_keys.numel(), device=device, dtype=torch.int64) - row_local_start[uniq_rows_rel]
+
+        dst = c_indptr[row_start:row_end][uniq_rows_rel] + local_pos
+        c_indices[dst] = uniq_cols
+        c_data[dst] = uniq_vals
 
     return c_data, c_indices
 
 
 def _run_spgemm_prepared(prepared):
+    _ensure_row_work(prepared)
     torch.cuda.synchronize()
     t_count0 = time.perf_counter()
     row_nnz_c = _spgemm_count_phase(prepared)
@@ -355,7 +486,10 @@ def _run_spgemm_prepared(prepared):
     torch.cuda.synchronize()
     fill_ms = (time.perf_counter() - t_fill0) * 1000.0
 
-    return c_data, c_indices, c_indptr, {"count_ms": count_ms, "fill_ms": fill_ms}
+    return c_data, c_indices, c_indptr, {
+        "count_ms": count_ms,
+        "fill_ms": fill_ms,
+    }
 
 
 def flagsparse_spgemm_csr(
@@ -372,7 +506,7 @@ def flagsparse_spgemm_csr(
     return_time=False,
     return_meta=False,
 ):
-    """CSR SpGEMM: C = A @ B with CSR output (non-transpose path)."""
+    """CSR SpGEMM: C = A @ B with CSR output (Triton-only main path)."""
     prepare_ms = 0.0
     if prepared is None:
         if any(

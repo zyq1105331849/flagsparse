@@ -1,6 +1,7 @@
 """
 SDDMM tests: load SuiteSparse .mtx as CSR pattern and benchmark
 out = alpha * dot(X[row], Y[col]) + beta * in.
+CuPy baseline uses sampled-dot on CSR pattern (not dense X@Y^T).
 """
 
 import argparse
@@ -59,9 +60,61 @@ def _fmt_check(value):
 
 
 def _status_label(value):
+    if isinstance(value, str):
+        return value
     if value is None:
         return "N/A"
     return "PASS" if value else "FAIL"
+
+
+def _is_resource_error(message):
+    text = str(message).lower()
+    resource_tokens = (
+        "out of memory",
+        "cudaerroroutofmemory",
+        "cuda error out of memory",
+        "insufficient resources",
+        "resource exhausted",
+        "memoryerror",
+        "cublas_status_alloc_failed",
+        "cusparse_status_insufficient_resources",
+    )
+    return any(token in text for token in resource_tokens)
+
+
+def _cupy_sampled_dot_chunked(x_cp, y_cp, row_ids_cp, col_ids_cp, chunk_nnz):
+    nnz = int(row_ids_cp.size)
+    out_cp = ast_ops.cp.empty((nnz,), dtype=x_cp.dtype)
+    for start in range(0, nnz, chunk_nnz):
+        end = min(nnz, start + chunk_nnz)
+        rows = row_ids_cp[start:end]
+        cols = col_ids_cp[start:end]
+        out_cp[start:end] = ast_ops.cp.sum(x_cp[rows] * y_cp[cols], axis=1)
+    return out_cp
+
+
+def _benchmark_cupy_sampled_reference(indices, indptr, x, y, data_in, alpha, beta, warmup, iters):
+    n_rows = int(indptr.numel()) - 1
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, dtype=torch.int64, device=x.device),
+        indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+    )
+    x_cp = ast_ops._cupy_from_torch(x)
+    y_cp = ast_ops._cupy_from_torch(y)
+    row_ids_cp = ast_ops._cupy_from_torch(row_ids)
+    col_ids_cp = ast_ops._cupy_from_torch(indices.to(torch.int64))
+    nnz = max(1, int(indices.numel()))
+    chunk_nnz = min(262144, nnz)
+    sampled_cp, cupy_ms = ast_ops._benchmark_cuda_op(
+        lambda: _cupy_sampled_dot_chunked(x_cp, y_cp, row_ids_cp, col_ids_cp, chunk_nnz),
+        warmup=warmup,
+        iters=iters,
+    )
+    sampled = ast_ops._torch_from_cupy(sampled_cp)
+    sampled = sampled * alpha
+    if beta != 0.0:
+        sampled = sampled + beta * data_in
+    return sampled, cupy_ms
 
 
 def _normalize_csv_path(csv_path):
@@ -120,7 +173,7 @@ def run_one_mtx(
     run_cusparse=True,
 ):
     device = torch.device("cuda")
-    pattern_values, indices, indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
+    _pattern_values, indices, indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
     nnz = int(indices.numel())
@@ -141,23 +194,31 @@ def run_one_mtx(
         "triton_first_call_ms": None,
         "prepare_ms": None,
         "pytorch_ms": None,
+        "cupy_ms": None,
         "cusparse_ms": None,
         "err_pt": None,
         "err_cu": None,
         "triton_ok_pt": None,
         "triton_ok_cu": None,
+        "cu_status": "REF_UNAVAILABLE",
+        "cu_reason": None,
         "cusparse_reason": None,
+        "triton_started": False,
+        "cu_started": False,
+        "fallback_used": False,
         "status": "UNKNOWN",
     }
 
     triton_values = None
     try:
+        result["triton_started"] = True
         triton_values, triton_ms, triton_first_ms, meta = _benchmark_triton_sddmm(
             data_in, indices, indptr, shape, x, y, alpha, beta, warmup, iters
         )
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_ms
         result["prepare_ms"] = meta.get("prepare_ms")
+        result["fallback_used"] = bool(meta.get("fallback_used", False))
     except Exception as exc:
         result["error"] = f"triton: {exc}"
 
@@ -182,32 +243,41 @@ def run_one_mtx(
 
     if run_cusparse:
         if ast_ops.cp is None:
-            result["cusparse_reason"] = "CuPy is not available"
+            result["cu_status"] = "REF_UNAVAILABLE"
+            result["cu_reason"] = "CuPy is not available"
         else:
             try:
-                x_cp = ast_ops._cupy_from_torch(x)
-                y_cp = ast_ops._cupy_from_torch(y)
-                dense_cp, result["cusparse_ms"] = ast_ops._benchmark_cuda_op(
-                    lambda: x_cp @ y_cp.T,
+                result["cu_started"] = True
+                cu_vals, cupy_ms = _benchmark_cupy_sampled_reference(
+                    indices=indices,
+                    indptr=indptr,
+                    x=x,
+                    y=y,
+                    data_in=data_in,
+                    alpha=alpha,
+                    beta=beta,
                     warmup=warmup,
                     iters=iters,
                 )
-                dense = ast_ops._torch_from_cupy(dense_cp)
-                row_ids = torch.repeat_interleave(
-                    torch.arange(n_rows, dtype=torch.int64, device=device),
-                    indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
-                )
-                cu_vals = alpha * dense[row_ids, indices.to(torch.int64)]
-                if beta != 0.0:
-                    cu_vals = cu_vals + beta * data_in
+                result["cupy_ms"] = cupy_ms
+                result["cusparse_ms"] = cupy_ms
                 if triton_values is not None:
                     atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
                     result["triton_ok_cu"] = bool(torch.allclose(triton_values, cu_vals, atol=atol, rtol=rtol))
                     result["err_cu"] = _scaled_allclose_error(triton_values, cu_vals, value_dtype)
+                    result["cu_status"] = "PASS" if result["triton_ok_cu"] else "FAIL"
+                else:
+                    result["cu_status"] = "REF_UNAVAILABLE"
+                    result["cu_reason"] = "Triton output is unavailable for CuPy comparison"
             except Exception as exc:
-                result["cusparse_reason"] = str(exc)
+                result["cu_status"] = "REF_RESOURCE" if _is_resource_error(exc) else "REF_UNAVAILABLE"
+                result["cu_reason"] = str(exc)
+    else:
+        result["cu_status"] = "REF_UNAVAILABLE"
+        result["cu_reason"] = "CuPy reference is disabled by CLI"
 
-    result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+    result["cusparse_reason"] = result["cu_reason"]
+    result["status"] = "PASS" if result["triton_ok_pt"] else "FAIL"
     return result
 
 
@@ -244,15 +314,15 @@ def run_mtx_batch(
 
 def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
-    print("Formats: FlagSparse=CSR SDDMM, cuBLAS(gemm)+gather baseline, PyTorch reference.")
+    print("Formats: FlagSparse=CSR SDDMM, CuPy sampled-dot baseline (not cuSPARSE API), PyTorch reference.")
     print(
         f"Equation: out = alpha*dot(x[row], y[col]) + beta*in  |  K={k_dim}  alpha={alpha}  beta={beta}"
     )
     print("-" * 196)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'K':>6} "
-        f"{'FlagSparse(ms)':>14} {'cuBLAS(ms)':>11} {'PyTorch(ms)':>11} "
-        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10} {'Prep(ms)':>9}"
+        f"{'FlagSparse(ms)':>14} {'CuPy(ms)':>11} {'PyTorch(ms)':>11} "
+        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU_Status':>12} {'Err(PT)':>10} {'Err(CU)':>10} {'Prep(ms)':>9}"
     )
     print("-" * 196)
 
@@ -260,19 +330,28 @@ def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta):
 def _print_sddmm_mtx_row(entry):
     name = os.path.basename(entry["path"])[:27]
     n_rows, n_cols = entry["shape"]
+    cupy_ms = entry.get("cupy_ms")
+    if cupy_ms is None:
+        cupy_ms = entry.get("cusparse_ms")
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {entry['nnz_pattern']:>10} {entry['k']:>6} "
-        f"{_fmt_ms(entry.get('triton_ms')):>14} {_fmt_ms(entry.get('cusparse_ms')):>11} {_fmt_ms(entry.get('pytorch_ms')):>11} "
-        f"{_fmt_speedup(entry.get('cusparse_ms'), entry.get('triton_ms')):>7} {_fmt_speedup(entry.get('pytorch_ms'), entry.get('triton_ms')):>7} "
-        f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_fmt_check(entry.get('triton_ok_cu')):>6} "
+        f"{_fmt_ms(entry.get('triton_ms')):>14} {_fmt_ms(cupy_ms):>11} {_fmt_ms(entry.get('pytorch_ms')):>11} "
+        f"{_fmt_speedup(cupy_ms, entry.get('triton_ms')):>7} {_fmt_speedup(entry.get('pytorch_ms'), entry.get('triton_ms')):>7} "
+        f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_status_label(entry.get('cu_status')):>12} "
         f"{_fmt_err(entry.get('err_pt')):>10} {_fmt_err(entry.get('err_cu')):>10} {_fmt_ms(entry.get('prepare_ms')):>9}"
     )
     err = entry.get("error")
+    cu_reason = entry.get("cu_reason")
     if err:
         msg = str(err).replace("\n", " ")
         if len(msg) > 220:
             msg = msg[:217] + "..."
         print(f"  NOTE: {msg}")
+    if cu_reason:
+        msg = str(cu_reason).replace("\n", " ")
+        if len(msg) > 220:
+            msg = msg[:217] + "..."
+        print(f"  CU_NOTE: {msg}")
 
 
 def print_mtx_results(results, value_dtype, index_dtype, k_dim, alpha, beta):
@@ -321,15 +400,20 @@ def run_all_dtypes_export_csv(
                         "n_rows": n_rows,
                         "n_cols": n_cols,
                         "nnz": entry["nnz"],
+                        "cupy_ms": entry.get("cupy_ms"),
                         "triton_ms": entry.get("triton_ms"),
                         "cusparse_ms": entry.get("cusparse_ms"),
                         "pytorch_ms": entry.get("pytorch_ms"),
                         "pt_status": _status_label(entry.get("triton_ok_pt")),
-                        "cu_status": _status_label(entry.get("triton_ok_cu")),
-                        "status": "PASS" if (entry.get("triton_ok_pt") or entry.get("triton_ok_cu")) else "FAIL",
+                        "cu_status": _status_label(entry.get("cu_status")),
+                        "status": entry.get("status"),
                         "err_pt": entry.get("err_pt"),
                         "err_cu": entry.get("err_cu"),
                         "error": entry.get("error"),
+                        "cu_reason": entry.get("cu_reason"),
+                        "triton_started": entry.get("triton_started"),
+                        "cu_started": entry.get("cu_started"),
+                        "fallback_used": entry.get("fallback_used"),
                         "nnz_pattern": entry.get("nnz_pattern"),
                         "k": entry.get("k"),
                         "alpha": entry.get("alpha"),
@@ -339,8 +423,9 @@ def run_all_dtypes_export_csv(
                 )
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
-        "triton_ms", "cusparse_ms", "pytorch_ms",
+        "triton_ms", "cupy_ms", "cusparse_ms", "pytorch_ms",
         "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
+        "cu_reason", "triton_started", "cu_started", "fallback_used",
         "nnz_pattern", "k", "alpha", "beta", "prepare_ms",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
@@ -436,7 +521,16 @@ def main():
     parser.add_argument("--k", type=int, default=DEFAULT_K, help="Dense feature dimension K")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0)
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument(
+        "--no-cupy-ref",
+        action="store_true",
+        help="Skip CuPy sampled-dot reference baseline",
+    )
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        help="Deprecated alias of --no-cupy-ref",
+    )
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument("--skip-api-checks", action="store_true")
     args = parser.parse_args()
@@ -451,6 +545,7 @@ def main():
         failed = run_api_validation_checks()
         if failed > 0:
             raise SystemExit(1)
+    run_cupy_ref = not (args.no_cupy_ref or args.no_cusparse)
 
     value_dtype = torch.float32 if args.dtype == "float32" else torch.float64
     index_dtype = torch.int32
@@ -481,7 +576,7 @@ def main():
             k_dim=args.k,
             alpha=args.alpha,
             beta=args.beta,
-            run_cusparse=not args.no_cusparse,
+            run_cusparse=run_cupy_ref,
         )
         return
 
@@ -502,7 +597,7 @@ def main():
         k_dim=args.k,
         alpha=args.alpha,
         beta=args.beta,
-        run_cusparse=not args.no_cusparse,
+        run_cusparse=run_cupy_ref,
     )
     print_mtx_results(results, value_dtype, index_dtype, args.k, args.alpha, args.beta)
 
