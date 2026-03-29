@@ -173,16 +173,22 @@ def _validate_sddmm_dense_inputs(data, prepared, x, y):
     return int(x.shape[1])
 
 
-def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out):
+def _prepare_validated_sddmm_out(prepared, x, out):
     nnz = prepared.nnz
     if out is None:
-        out = torch.empty(nnz, dtype=x.dtype, device=x.device)
+        return torch.empty(nnz, dtype=x.dtype, device=x.device)
     if out.ndim != 1 or out.numel() != nnz:
         raise ValueError("out must be a 1D tensor with length nnz")
     if not out.is_cuda or out.device != x.device:
         raise ValueError("out must be a CUDA tensor on the same device as x")
     if out.dtype != x.dtype:
         raise TypeError("out dtype must match x/y dtype")
+    return out
+
+
+def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out):
+    nnz = prepared.nnz
+    out = _prepare_validated_sddmm_out(prepared, x, out)
     if nnz == 0:
         return out, {"block_k": prepared.block_k, "num_warps": prepared.num_warps}
 
@@ -253,8 +259,7 @@ def flagsparse_sddmm_csr(
         raise ValueError("data is required when beta is non-zero")
     k_dim = _validate_sddmm_dense_inputs(data, prepared, x, y)
     if k_dim == 0:
-        if out is None:
-            out = torch.empty(prepared.nnz, dtype=x.dtype, device=x.device)
+        out = _prepare_validated_sddmm_out(prepared, x, out)
         if beta == 0.0 or data is None:
             out.zero_()
         else:

@@ -368,6 +368,19 @@ def run_api_validation_checks():
         ("x/y K mismatch", lambda: ast.flagsparse_sddmm_csr(indices=indices, indptr=indptr, x=x, y=y[:, :4], shape=shape), ValueError),
         ("data length mismatch", lambda: ast.flagsparse_sddmm_csr(data=torch.randn(2, dtype=torch.float32, device=device), indices=indices, indptr=indptr, x=x, y=y, shape=shape), ValueError),
         ("beta needs data", lambda: ast.flagsparse_sddmm_csr(indices=indices, indptr=indptr, x=x, y=y, shape=shape, beta=0.5), ValueError),
+        (
+            "K=0 out shape mismatch",
+            lambda: ast.flagsparse_sddmm_csr(
+                data=data,
+                indices=indices,
+                indptr=indptr,
+                x=x[:, :0],
+                y=y[:, :0],
+                shape=shape,
+                out=torch.empty(2, dtype=torch.float32, device=device),
+            ),
+            ValueError,
+        ),
     ]
     failed = 0
     print("-" * 96)

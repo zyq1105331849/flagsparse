@@ -418,6 +418,14 @@ def flagsparse_spgemm_csr(
         if not isinstance(out, (tuple, list)) or len(out) != 3:
             raise TypeError("out must be a tuple/list of (data, indices, indptr)")
         out_data, out_indices, out_indptr = out
+        if not out_data.is_cuda or not out_indices.is_cuda or not out_indptr.is_cuda:
+            raise ValueError("out data/indices/indptr must be CUDA tensors")
+        if (
+            out_data.device != c_data.device
+            or out_indices.device != c_indices.device
+            or out_indptr.device != c_indptr.device
+        ):
+            raise ValueError("out data/indices/indptr must be on the same CUDA device as computed C")
         if out_data.shape != c_data.shape or out_data.dtype != c_data.dtype:
             raise ValueError("out data shape/dtype must match computed C data")
         if out_indices.shape != c_indices.shape or out_indices.dtype != c_indices.dtype:

@@ -1,5 +1,5 @@
 """
-SpGEMM tests: load SuiteSparse .mtx, run CSR SpGEMM(A@B) with A=B, and report
+SpGEMM tests: load SuiteSparse .mtx, run CSR SpGEMM(A@B), and report
 error/performance in a SpMM-like table and CSV format.
 """
 
@@ -31,7 +31,8 @@ CSV_VALUE_DTYPES = [torch.float32, torch.float64]
 CSV_INDEX_DTYPES = [torch.int32]
 WARMUP = 5
 ITERS = 20
-INPUT_MODE = "A_EQUALS_B"
+DEFAULT_INPUT_MODE = "auto"
+TARGET_TIMED_WINDOW_SECONDS = 8.0
 
 
 def _dtype_name(dtype):
@@ -74,53 +75,132 @@ def _normalize_csv_path(csv_path):
     return csv_path
 
 
-def _build_torch_spgemm_reference(a_data, a_indices, a_indptr, shape):
+def _log_stage(path, stage, start_time):
+    elapsed = time.perf_counter() - start_time
+    print(f"[SpGEMM][{os.path.basename(path)}] {stage} (elapsed={elapsed:.2f}s)", flush=True)
+
+
+def _resolve_input_mode(requested_mode, shape):
     n_rows, n_cols = shape
+    if requested_mode == "a_equals_b":
+        if n_rows != n_cols:
+            raise ValueError(
+                f"input_mode=a_equals_b requires square matrix, got {n_rows}x{n_cols}"
+            )
+        return "A_EQUALS_B"
+    if requested_mode == "a_at":
+        return "A_AT"
+    if requested_mode == "auto":
+        return "A_EQUALS_B" if n_rows == n_cols else "A_AT"
+    raise ValueError(f"unsupported input_mode: {requested_mode}")
+
+
+def _build_spgemm_rhs(a_data, a_indices, a_indptr, a_shape, mode):
+    if mode == "A_EQUALS_B":
+        return a_data, a_indices, a_indptr, a_shape
+    if mode != "A_AT":
+        raise ValueError(f"unsupported resolved mode: {mode}")
+    a_t = ast_ops._to_torch_csr(a_data, a_indices, a_indptr, a_shape)
+    b_t = a_t.transpose(0, 1)
+    return ast_ops._torch_sparse_to_csr(b_t)
+
+
+def _build_torch_spgemm_reference(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+):
     a_csr = torch.sparse_csr_tensor(
         a_indptr.to(torch.int64),
         a_indices.to(torch.int64),
         a_data,
-        size=shape,
+        size=a_shape,
         device=a_data.device,
+    )
+    b_csr = torch.sparse_csr_tensor(
+        b_indptr.to(torch.int64),
+        b_indices.to(torch.int64),
+        b_data,
+        size=b_shape,
+        device=b_data.device,
     )
     ref_format = "CSR"
     try:
-        op = lambda: torch.sparse.mm(a_csr, a_csr)
+        op = lambda: torch.sparse.mm(a_csr, b_csr)
         ref_sparse = op()
     except Exception:
         ref_format = "COO"
         a_coo = a_csr.to_sparse_coo().coalesce()
-        op = lambda: torch.sparse.mm(a_coo, a_coo)
+        b_coo = b_csr.to_sparse_coo().coalesce()
+        op = lambda: torch.sparse.mm(a_coo, b_coo)
         ref_sparse = op()
-    if ref_sparse.layout != torch.sparse_coo and ref_sparse.layout != torch.sparse_csr:
+    if ref_sparse.layout not in (torch.sparse_coo, torch.sparse_csr):
         raise RuntimeError(f"Unexpected torch sparse.mm result layout: {ref_sparse.layout}")
     return ast_ops._torch_sparse_to_csr(ref_sparse), ref_format, op
 
 
-def _benchmark_triton_spgemm(a_data, a_indices, a_indptr, shape, warmup, iters):
+def _pick_effective_benchmark_loops(warmup, iters, first_call_ms):
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    per_call_s = max(float(first_call_ms) / 1000.0, 1e-4)
+    target_iters = max(1, int(TARGET_TIMED_WINDOW_SECONDS / per_call_s))
+    eff_iters = min(iters, target_iters)
+    warmup_cap = max(1, eff_iters // 2)
+    eff_warmup = min(warmup, warmup_cap)
+    return eff_warmup, eff_iters
+
+
+def _benchmark_triton_spgemm(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+    warmup,
+    iters,
+    start_time,
+    mtx_path,
+):
+    _log_stage(mtx_path, "prepare", start_time)
     torch.cuda.synchronize()
     t_prepare0 = time.perf_counter()
     prepared = ast.prepare_spgemm_csr(
-        a_data, a_indices, a_indptr, shape,
-        a_data, a_indices, a_indptr, shape,
+        a_data, a_indices, a_indptr, a_shape,
+        b_data, b_indices, b_indptr, b_shape,
     )
     torch.cuda.synchronize()
     prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
 
+    _log_stage(mtx_path, "first-call", start_time)
     torch.cuda.synchronize()
     t_first0 = time.perf_counter()
-    _ = ast.flagsparse_spgemm_csr(prepared=prepared)
+    first_result, first_meta = ast.flagsparse_spgemm_csr(prepared=prepared, return_meta=True)
     torch.cuda.synchronize()
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
+    first_meta = dict(first_meta)
+    first_meta["prepare_ms"] = prepare_ms
 
+    eff_warmup, eff_iters = _pick_effective_benchmark_loops(
+        warmup=warmup, iters=iters, first_call_ms=first_call_ms
+    )
+    first_meta["effective_warmup"] = eff_warmup
+    first_meta["effective_iters"] = eff_iters
+
+    _log_stage(mtx_path, f"timed-run warmup={eff_warmup} iters={eff_iters}", start_time)
     triton_result, triton_ms = ast_ops._benchmark_cuda_op(
         lambda: ast.flagsparse_spgemm_csr(prepared=prepared),
-        warmup=warmup,
-        iters=iters,
+        warmup=eff_warmup,
+        iters=eff_iters,
     )
-    _, meta = ast.flagsparse_spgemm_csr(prepared=prepared, return_meta=True)
-    meta["prepare_ms"] = prepare_ms
-    return triton_result, triton_ms, first_call_ms, meta
+    return triton_result, triton_ms, first_call_ms, first_meta
 
 
 def run_one_mtx(
@@ -130,26 +210,42 @@ def run_one_mtx(
     warmup=WARMUP,
     iters=ITERS,
     run_cusparse=True,
+    input_mode=DEFAULT_INPUT_MODE,
 ):
+    case_start = time.perf_counter()
     device = torch.device("cuda")
-    a_data, a_indices, a_indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
+
+    _log_stage(mtx_path, "load", case_start)
+    a_data, a_indices, a_indptr, a_shape = load_mtx_to_csr_torch(
+        mtx_path, dtype=value_dtype, device=device
+    )
     a_indices = a_indices.to(index_dtype)
-    n_rows, n_cols = shape
+    resolved_mode = _resolve_input_mode(input_mode, a_shape)
+    b_data, b_indices, b_indptr, b_shape = _build_spgemm_rhs(
+        a_data, a_indices, a_indptr, a_shape, resolved_mode
+    )
+    b_indices = b_indices.to(index_dtype)
+
     nnz_a = int(a_data.numel())
+    nnz_b = int(b_data.numel())
     result = {
         "path": mtx_path,
-        "shape": shape,
+        "shape": a_shape,
+        "shape_a": a_shape,
+        "shape_b": b_shape,
         "nnz": nnz_a,
         "nnz_a": nnz_a,
-        "nnz_b": nnz_a,
+        "nnz_b": nnz_b,
         "nnz_c": None,
-        "input_mode": INPUT_MODE,
+        "input_mode": resolved_mode,
         "error": None,
         "triton_ms": None,
         "triton_first_call_ms": None,
         "prepare_ms": None,
         "count_ms": None,
         "fill_ms": None,
+        "effective_warmup": None,
+        "effective_iters": None,
         "pytorch_ms": None,
         "cusparse_ms": None,
         "err_pt": None,
@@ -165,26 +261,59 @@ def run_one_mtx(
     triton_result = None
     try:
         triton_result, triton_ms, triton_first_ms, meta = _benchmark_triton_spgemm(
-            a_data, a_indices, a_indptr, shape, warmup=warmup, iters=iters
+            a_data,
+            a_indices,
+            a_indptr,
+            a_shape,
+            b_data,
+            b_indices,
+            b_indptr,
+            b_shape,
+            warmup=warmup,
+            iters=iters,
+            start_time=case_start,
+            mtx_path=mtx_path,
         )
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_ms
         result["prepare_ms"] = meta.get("prepare_ms")
         result["count_ms"] = meta.get("count_ms")
         result["fill_ms"] = meta.get("fill_ms")
-        result["nnz_c"] = int(triton_result[0].numel())
+        result["effective_warmup"] = meta.get("effective_warmup")
+        result["effective_iters"] = meta.get("effective_iters")
+        result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
     except Exception as exc:
         result["error"] = f"triton: {exc}"
 
+    _log_stage(mtx_path, "reference", case_start)
     try:
-        ref_result, ref_format, ref_op = _build_torch_spgemm_reference(a_data, a_indices, a_indptr, shape)
+        ref_result, ref_format, ref_op = _build_torch_spgemm_reference(
+            a_data,
+            a_indices,
+            a_indptr,
+            a_shape,
+            b_data,
+            b_indices,
+            b_indptr,
+            b_shape,
+        )
         result["pytorch_format"] = ref_format
-        _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(ref_op, warmup=warmup, iters=iters)
+
+        ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
+        ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
+        ref_warmup = max(0, int(ref_warmup))
+        ref_iters = max(1, int(ref_iters))
+        _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(
+            ref_op,
+            warmup=ref_warmup,
+            iters=ref_iters,
+        )
     except Exception as exc:
         result["error"] = str(exc) if result["error"] is None else f"{result['error']}; ref: {exc}"
         result["status"] = "REF_FAIL"
         return result
 
+    _log_stage(mtx_path, "compare", case_start)
     if triton_result is not None:
         summary = ast_ops._spgemm_pairwise_summary(triton_result, ref_result, value_dtype)
         result["triton_ok_pt"] = summary["match"]
@@ -203,19 +332,31 @@ def run_one_mtx(
                         ast_ops._cupy_from_torch(a_indices.to(torch.int64)),
                         ast_ops._cupy_from_torch(a_indptr.to(torch.int64)),
                     ),
-                    shape=shape,
+                    shape=a_shape,
                 )
+                b_cp = ast_ops.cpx_sparse.csr_matrix(
+                    (
+                        ast_ops._cupy_from_torch(b_data),
+                        ast_ops._cupy_from_torch(b_indices.to(torch.int64)),
+                        ast_ops._cupy_from_torch(b_indptr.to(torch.int64)),
+                    ),
+                    shape=b_shape,
+                )
+                ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
+                ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
+                ref_warmup = max(0, int(ref_warmup))
+                ref_iters = max(1, int(ref_iters))
                 c_cp, result["cusparse_ms"] = ast_ops._benchmark_cuda_op(
-                    lambda: a_cp @ a_cp,
-                    warmup=warmup,
-                    iters=iters,
+                    lambda: a_cp @ b_cp,
+                    warmup=ref_warmup,
+                    iters=ref_iters,
                 )
                 c_coo = c_cp.tocoo()
                 rows = ast_ops._torch_from_cupy(c_coo.row).to(torch.int64)
                 cols = ast_ops._torch_from_cupy(c_coo.col).to(torch.int64)
                 vals = ast_ops._torch_from_cupy(c_coo.data).to(value_dtype)
                 c_t = torch.sparse_coo_tensor(
-                    torch.stack([rows, cols]), vals, shape, device=device
+                    torch.stack([rows, cols]), vals, (a_shape[0], b_shape[1]), device=device
                 ).coalesce()
                 c_ref = ast_ops._torch_sparse_to_csr(c_t)
                 if triton_result is not None:
@@ -236,10 +377,13 @@ def run_mtx_batch(
     warmup=WARMUP,
     iters=ITERS,
     run_cusparse=True,
+    input_mode=DEFAULT_INPUT_MODE,
     on_result=None,
 ):
     results = []
-    for path in mtx_paths:
+    total = len(mtx_paths)
+    for idx, path in enumerate(mtx_paths, start=1):
+        print(f"[SpGEMM] ({idx}/{total}) {path}", flush=True)
         entry = run_one_mtx(
             path,
             value_dtype=value_dtype,
@@ -247,6 +391,7 @@ def run_mtx_batch(
             warmup=warmup,
             iters=iters,
             run_cusparse=run_cusparse,
+            input_mode=input_mode,
         )
         results.append(entry)
         if on_result is not None:
@@ -256,23 +401,25 @@ def run_mtx_batch(
 
 def _print_spgemm_mtx_header(value_dtype, index_dtype):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
-    print("Formats: FlagSparse=CSR SpGEMM(A@B, A=B), cuSPARSE=CSR@CSR, PyTorch=sparse.mm.")
+    print("Formats: FlagSparse=CSR SpGEMM(A@B), cuSPARSE=CSR@CSR, PyTorch=sparse.mm.")
     print("Timing stays in native dtype; Err fields are max relative error vs each baseline.")
-    print("-" * 206)
+    print("-" * 220)
     print(
-        f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ_A':>10} {'NNZ_B':>10} {'NNZ_C':>10} "
+        f"{'Matrix':<28} {'Mode':<10} {'A_rows':>7} {'A_cols':>7} {'B_cols':>7} {'NNZ_A':>10} {'NNZ_B':>10} {'NNZ_C':>10} "
         f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
         f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10} "
         f"{'Prep(ms)':>9} {'Count(ms)':>10} {'Fill(ms)':>9}"
     )
-    print("-" * 206)
+    print("-" * 220)
 
 
 def _print_spgemm_mtx_row(entry):
     name = os.path.basename(entry["path"])[:27]
-    n_rows, n_cols = entry["shape"]
+    a_rows, a_cols = entry["shape_a"]
+    b_cols = entry["shape_b"][1]
     print(
-        f"{name:<28} {n_rows:>7} {n_cols:>7} {entry['nnz_a']:>10} {entry['nnz_b']:>10} {str(entry['nnz_c'] if entry['nnz_c'] is not None else 'N/A'):>10} "
+        f"{name:<28} {entry.get('input_mode', 'N/A'):<10} {a_rows:>7} {a_cols:>7} {b_cols:>7} "
+        f"{entry['nnz_a']:>10} {entry['nnz_b']:>10} {str(entry['nnz_c'] if entry['nnz_c'] is not None else 'N/A'):>10} "
         f"{_fmt_ms(entry.get('triton_ms')):>14} {_fmt_ms(entry.get('cusparse_ms')):>13} {_fmt_ms(entry.get('pytorch_ms')):>11} "
         f"{_fmt_speedup(entry.get('cusparse_ms'), entry.get('triton_ms')):>7} {_fmt_speedup(entry.get('pytorch_ms'), entry.get('triton_ms')):>7} "
         f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_fmt_check(entry.get('triton_ok_cu')):>6} "
@@ -291,7 +438,7 @@ def print_mtx_results(results, value_dtype, index_dtype):
     _print_spgemm_mtx_header(value_dtype, index_dtype)
     for entry in results:
         _print_spgemm_mtx_row(entry)
-    print("-" * 206)
+    print("-" * 220)
 
 
 def run_all_dtypes_export_csv(
@@ -300,12 +447,13 @@ def run_all_dtypes_export_csv(
     warmup=WARMUP,
     iters=ITERS,
     run_cusparse=True,
+    input_mode=DEFAULT_INPUT_MODE,
 ):
     csv_path = _normalize_csv_path(csv_path)
     rows = []
     for value_dtype in CSV_VALUE_DTYPES:
         for index_dtype in CSV_INDEX_DTYPES:
-            print("=" * 170)
+            print("=" * 180)
             _print_spgemm_mtx_header(value_dtype, index_dtype)
             results = run_mtx_batch(
                 paths,
@@ -314,9 +462,10 @@ def run_all_dtypes_export_csv(
                 warmup=warmup,
                 iters=iters,
                 run_cusparse=run_cusparse,
+                input_mode=input_mode,
                 on_result=_print_spgemm_mtx_row,
             )
-            print("-" * 206)
+            print("-" * 220)
             for entry in results:
                 n_rows, n_cols = entry["shape"]
                 rows.append(
@@ -332,7 +481,7 @@ def run_all_dtypes_export_csv(
                         "pytorch_ms": entry.get("pytorch_ms"),
                         "pt_status": _status_label(entry.get("triton_ok_pt")),
                         "cu_status": _status_label(entry.get("triton_ok_cu")),
-                        "status": "PASS" if (entry.get("triton_ok_pt") or entry.get("triton_ok_cu")) else "FAIL",
+                        "status": entry.get("status"),
                         "err_pt": entry.get("err_pt"),
                         "err_cu": entry.get("err_cu"),
                         "error": entry.get("error"),
@@ -340,16 +489,21 @@ def run_all_dtypes_export_csv(
                         "nnz_b": entry.get("nnz_b"),
                         "nnz_c": entry.get("nnz_c"),
                         "input_mode": entry.get("input_mode"),
+                        "shape_a": str(entry.get("shape_a")),
+                        "shape_b": str(entry.get("shape_b")),
                         "prepare_ms": entry.get("prepare_ms"),
                         "count_ms": entry.get("count_ms"),
                         "fill_ms": entry.get("fill_ms"),
+                        "effective_warmup": entry.get("effective_warmup"),
+                        "effective_iters": entry.get("effective_iters"),
                     }
                 )
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms",
         "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
-        "nnz_a", "nnz_b", "nnz_c", "input_mode", "prepare_ms", "count_ms", "fill_ms",
+        "nnz_a", "nnz_b", "nnz_c", "input_mode", "shape_a", "shape_b",
+        "prepare_ms", "count_ms", "fill_ms", "effective_warmup", "effective_iters",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -368,6 +522,10 @@ def run_api_validation_checks():
     a_indices = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
     a_indptr = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
     shape = (2, 2)
+    c_data, c_indices, c_indptr, _ = ast.flagsparse_spgemm_csr(
+        a_data, a_indices, a_indptr, shape,
+        a_data, a_indices, a_indptr, shape,
+    )
     negative_cases = [
         (
             "shape mismatch",
@@ -392,6 +550,19 @@ def run_api_validation_checks():
                 a_data, a_indices, a_indptr, shape,
             ),
             TypeError,
+        ),
+        (
+            "out data must be CUDA",
+            lambda: ast.flagsparse_spgemm_csr(
+                a_data, a_indices, a_indptr, shape,
+                a_data, a_indices, a_indptr, shape,
+                out=(
+                    torch.empty(c_data.shape, dtype=c_data.dtype),
+                    torch.empty(c_indices.shape, dtype=c_indices.dtype, device=device),
+                    torch.empty(c_indptr.shape, dtype=c_indptr.dtype, device=device),
+                ),
+            ),
+            ValueError,
         ),
     ]
     failed = 0
@@ -451,6 +622,13 @@ def main():
     parser.add_argument("--no-cusparse", action="store_true")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument("--skip-api-checks", action="store_true")
+    parser.add_argument(
+        "--input-mode",
+        type=str,
+        default=DEFAULT_INPUT_MODE,
+        choices=["auto", "a_equals_b", "a_at"],
+        help="extra option: auto(square->A@A, rectangular->A@A^T) to avoid shape mismatch on non-square matrices",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -477,25 +655,30 @@ def main():
             print("No .mtx files found. Specify files or a directory.")
             return
         csv_path = _normalize_csv_path(args.csv)
-        print("=" * 108)
-        print("FLAGSPARSE SpGEMM - f32/f64 with int32, export to CSV (A=B)")
-        print("=" * 108)
-        print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {csv_path}")
+        print("=" * 120)
+        print("FLAGSPARSE SpGEMM - f32/f64 with int32, export to CSV")
+        print("=" * 120)
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  "
+            f"input_mode: {args.input_mode}  |  CSV: {csv_path}"
+        )
         run_all_dtypes_export_csv(
             paths,
             csv_path,
             warmup=args.warmup,
             iters=args.iters,
             run_cusparse=not args.no_cusparse,
+            input_mode=args.input_mode,
         )
         return
 
-    print("=" * 146)
-    print("FLAGSPARSE SpGEMM - SuiteSparse .mtx batch (A=B, CSR)")
-    print("=" * 146)
+    print("=" * 160)
+    print("FLAGSPARSE SpGEMM - SuiteSparse .mtx batch (CSR)")
+    print("=" * 160)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
-        f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  warmup: {args.warmup}  iters: {args.iters}  input_mode: {INPUT_MODE}"
+        f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  warmup: {args.warmup}  "
+        f"iters: {args.iters}  input_mode: {args.input_mode}"
     )
     print()
     results = run_mtx_batch(
@@ -505,6 +688,7 @@ def main():
         warmup=args.warmup,
         iters=args.iters,
         run_cusparse=not args.no_cusparse,
+        input_mode=args.input_mode,
     )
     print_mtx_results(results, value_dtype, index_dtype)
 
