@@ -29,8 +29,8 @@ VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
 CSV_VALUE_DTYPES = [torch.float32, torch.float64]
 CSV_INDEX_DTYPES = [torch.int32]
-WARMUP = 5
-ITERS = 20
+WARMUP = 10
+ITERS = 50
 DEFAULT_INPUT_MODE = "auto"
 TARGET_TIMED_WINDOW_SECONDS = 8.0
 
@@ -63,6 +63,98 @@ def _status_label(value):
     if value is None:
         return "N/A"
     return "PASS" if value else "FAIL"
+
+
+def _append_error(current, message):
+    msg = str(message)
+    if not current:
+        return msg
+    return f"{current}; {msg}"
+
+
+def _allclose_error_ratio(actual, reference, atol, rtol):
+    if actual.numel() == 0:
+        return 0.0
+    diff = torch.abs(actual - reference).to(torch.float64)
+    tol = (atol + rtol * torch.abs(reference)).to(torch.float64)
+    return float(torch.max(diff / tol).item())
+
+
+def _spgemm_compare_metrics(candidate, reference, value_dtype):
+    c_data, c_indices, c_indptr, c_shape = candidate
+    r_data, r_indices, r_indptr, r_shape = reference
+    if c_shape != r_shape:
+        return {
+            "pattern_ok": False,
+            "pass": False,
+            "err_ratio": float("inf"),
+            "max_abs_error": float("inf"),
+            "max_relative_error": float("inf"),
+            "reason": f"shape mismatch {c_shape} vs {r_shape}",
+        }
+
+    c_keys, c_vals = ast_ops._csr_to_sorted_pairs(c_data, c_indices, c_indptr, c_shape[1])
+    r_keys, r_vals = ast_ops._csr_to_sorted_pairs(r_data, r_indices, r_indptr, r_shape[1])
+    if c_keys.numel() != r_keys.numel():
+        return {
+            "pattern_ok": False,
+            "pass": False,
+            "err_ratio": float("inf"),
+            "max_abs_error": float("inf"),
+            "max_relative_error": float("inf"),
+            "reason": f"nnz mismatch {c_keys.numel()} vs {r_keys.numel()}",
+        }
+    if c_keys.numel() > 0 and not torch.equal(c_keys, r_keys):
+        return {
+            "pattern_ok": False,
+            "pass": False,
+            "err_ratio": float("inf"),
+            "max_abs_error": float("inf"),
+            "max_relative_error": float("inf"),
+            "reason": "sparsity pattern mismatch",
+        }
+
+    if c_vals.numel() == 0:
+        return {
+            "pattern_ok": True,
+            "pass": True,
+            "err_ratio": 0.0,
+            "max_abs_error": 0.0,
+            "max_relative_error": 0.0,
+            "reason": "ok",
+        }
+
+    atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
+    err_ratio = _allclose_error_ratio(c_vals, r_vals, atol, rtol)
+    abs_diff = torch.abs(c_vals - r_vals)
+    max_abs = float(torch.max(abs_diff).item())
+    ref_max = float(torch.max(torch.abs(r_vals)).item())
+    max_rel = 0.0 if ref_max == 0.0 else max_abs / ref_max
+    ok = (not torch.isnan(torch.tensor(err_ratio)).item()) and err_ratio <= 1.0
+    return {
+        "pattern_ok": True,
+        "pass": bool(ok),
+        "err_ratio": err_ratio,
+        "max_abs_error": max_abs,
+        "max_relative_error": max_rel,
+        "reason": "ok" if ok else "value mismatch",
+    }
+
+
+def _classify_reference_reason(*messages):
+    merged = " ".join(str(m).lower() for m in messages if m)
+    if not merged:
+        return "REF_UNAVAILABLE"
+    if "out of memory" in merged:
+        return "REF_OOM"
+    if (
+        "insufficient resources" in merged
+        or "cusparsespgemm_workestimation" in merged
+        or "cusparsespgemm_compute" in merged
+        or "resource" in merged
+    ):
+        return "REF_RESOURCE"
+    return "REF_UNAVAILABLE"
 
 
 def _normalize_csv_path(csv_path):
@@ -145,11 +237,11 @@ def _build_torch_spgemm_reference(
     return ast_ops._torch_sparse_to_csr(ref_sparse), ref_format, op
 
 
-def _pick_effective_benchmark_loops(warmup, iters, first_call_ms):
+def _pick_effective_benchmark_loops(warmup, iters, first_call_ms, target_window_seconds):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
     per_call_s = max(float(first_call_ms) / 1000.0, 1e-4)
-    target_iters = max(1, int(TARGET_TIMED_WINDOW_SECONDS / per_call_s))
+    target_iters = max(1, int(float(target_window_seconds) / per_call_s))
     eff_iters = min(iters, target_iters)
     warmup_cap = max(1, eff_iters // 2)
     eff_warmup = min(warmup, warmup_cap)
@@ -167,6 +259,8 @@ def _benchmark_flagsparse_spgemm(
     b_shape,
     warmup,
     iters,
+    adaptive_loops,
+    target_window_seconds,
     start_time,
     mtx_path,
 ):
@@ -189,9 +283,16 @@ def _benchmark_flagsparse_spgemm(
     first_meta = dict(first_meta)
     first_meta["prepare_ms"] = prepare_ms
 
-    eff_warmup, eff_iters = _pick_effective_benchmark_loops(
-        warmup=warmup, iters=iters, first_call_ms=first_call_ms
-    )
+    if adaptive_loops:
+        eff_warmup, eff_iters = _pick_effective_benchmark_loops(
+            warmup=warmup,
+            iters=iters,
+            first_call_ms=first_call_ms,
+            target_window_seconds=target_window_seconds,
+        )
+    else:
+        eff_warmup = max(0, int(warmup))
+        eff_iters = max(1, int(iters))
     first_meta["effective_warmup"] = eff_warmup
     first_meta["effective_iters"] = eff_iters
 
@@ -212,6 +313,8 @@ def run_one_mtx(
     iters=ITERS,
     run_cusparse=True,
     input_mode=DEFAULT_INPUT_MODE,
+    adaptive_loops=False,
+    target_window_seconds=TARGET_TIMED_WINDOW_SECONDS,
 ):
     case_start = time.perf_counter()
     device = torch.device("cuda")
@@ -229,6 +332,11 @@ def run_one_mtx(
 
     nnz_a = int(a_data.numel())
     nnz_b = int(b_data.numel())
+    print(
+        f"[SpGEMM][{os.path.basename(mtx_path)}] preflight mode={resolved_mode} "
+        f"shape_a={a_shape} shape_b={b_shape} nnz_a={nnz_a} nnz_b={nnz_b}",
+        flush=True,
+    )
     result = {
         "path": mtx_path,
         "shape": a_shape,
@@ -240,6 +348,9 @@ def run_one_mtx(
         "nnz_c": None,
         "input_mode": resolved_mode,
         "error": None,
+        "triton_started": False,
+        "ref_started": False,
+        "ref_reason_code": None,
         "triton_ms": None,
         "triton_first_call_ms": None,
         "prepare_ms": None,
@@ -251,6 +362,10 @@ def run_one_mtx(
         "cusparse_ms": None,
         "err_pt": None,
         "err_cu": None,
+        "max_abs_err_pt": None,
+        "max_rel_err_pt": None,
+        "max_abs_err_cu": None,
+        "max_rel_err_cu": None,
         "triton_ok_pt": None,
         "triton_ok_cu": None,
         "pytorch_reason": None,
@@ -261,6 +376,7 @@ def run_one_mtx(
 
     triton_result = None
     try:
+        result["triton_started"] = True
         triton_result, triton_ms, triton_first_ms, meta = _benchmark_flagsparse_spgemm(
             a_data,
             a_indices,
@@ -272,6 +388,8 @@ def run_one_mtx(
             b_shape,
             warmup=warmup,
             iters=iters,
+            adaptive_loops=adaptive_loops,
+            target_window_seconds=target_window_seconds,
             start_time=case_start,
             mtx_path=mtx_path,
         )
@@ -284,9 +402,18 @@ def run_one_mtx(
         result["effective_iters"] = meta.get("effective_iters")
         result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
     except Exception as exc:
-        result["error"] = f"triton: {exc}"
+        result["error"] = _append_error(result["error"], f"triton: {exc}")
 
     _log_stage(mtx_path, "reference", case_start)
+    result["ref_started"] = True
+    ref_result = None
+    pt_compared = False
+    cu_compared = False
+    ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
+    ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
+    ref_warmup = max(0, int(ref_warmup))
+    ref_iters = max(1, int(ref_iters))
+
     try:
         ref_result, ref_format, ref_op = _build_torch_spgemm_reference(
             a_data,
@@ -299,28 +426,23 @@ def run_one_mtx(
             b_shape,
         )
         result["pytorch_format"] = ref_format
-
-        ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
-        ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
-        ref_warmup = max(0, int(ref_warmup))
-        ref_iters = max(1, int(ref_iters))
         _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(
             ref_op,
             warmup=ref_warmup,
             iters=ref_iters,
         )
+        if triton_result is not None:
+            pt_metrics = _spgemm_compare_metrics(triton_result, ref_result, value_dtype)
+            result["triton_ok_pt"] = pt_metrics["pass"]
+            result["err_pt"] = pt_metrics["err_ratio"]
+            result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
+            result["max_rel_err_pt"] = pt_metrics["max_relative_error"]
+            if not pt_metrics["pattern_ok"]:
+                result["error"] = _append_error(result["error"], f"pt_ref: {pt_metrics['reason']}")
+            pt_compared = True
     except Exception as exc:
-        result["error"] = str(exc) if result["error"] is None else f"{result['error']}; ref: {exc}"
-        result["status"] = "REF_FAIL"
-        return result
-
-    _log_stage(mtx_path, "compare", case_start)
-    if triton_result is not None:
-        summary = ast_ops._spgemm_pairwise_summary(triton_result, ref_result, value_dtype)
-        result["triton_ok_pt"] = summary["match"]
-        result["err_pt"] = summary["max_relative_error"]
-    else:
-        result["triton_ok_pt"] = False
+        result["pytorch_reason"] = str(exc)
+        result["error"] = _append_error(result["error"], f"pt_ref: {exc}")
 
     if run_cusparse:
         if ast_ops.cp is None or ast_ops.cpx_sparse is None:
@@ -361,13 +483,37 @@ def run_one_mtx(
                 ).coalesce()
                 c_ref = ast_ops._torch_sparse_to_csr(c_t)
                 if triton_result is not None:
-                    cu_summary = ast_ops._spgemm_pairwise_summary(triton_result, c_ref, value_dtype)
-                    result["triton_ok_cu"] = cu_summary["match"]
-                    result["err_cu"] = cu_summary["max_relative_error"]
+                    cu_metrics = _spgemm_compare_metrics(triton_result, c_ref, value_dtype)
+                    result["triton_ok_cu"] = cu_metrics["pass"]
+                    result["err_cu"] = cu_metrics["err_ratio"]
+                    result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
+                    result["max_rel_err_cu"] = cu_metrics["max_relative_error"]
+                    if not cu_metrics["pattern_ok"]:
+                        result["error"] = _append_error(result["error"], f"cu_ref: {cu_metrics['reason']}")
+                    cu_compared = True
             except Exception as exc:
                 result["cusparse_reason"] = str(exc)
+                result["error"] = _append_error(result["error"], f"cu_ref: {exc}")
 
-    result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+    _log_stage(mtx_path, "compare", case_start)
+    if triton_result is None:
+        result["status"] = "FAIL"
+        result["ref_reason_code"] = _classify_reference_reason(
+            result.get("pytorch_reason"),
+            result.get("cusparse_reason"),
+            result.get("error"),
+        )
+        return result
+
+    if pt_compared or cu_compared:
+        result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+    else:
+        ref_code = _classify_reference_reason(
+            result.get("pytorch_reason"),
+            result.get("cusparse_reason"),
+        )
+        result["ref_reason_code"] = ref_code
+        result["status"] = ref_code
     return result
 
 
@@ -379,6 +525,8 @@ def run_mtx_batch(
     iters=ITERS,
     run_cusparse=True,
     input_mode=DEFAULT_INPUT_MODE,
+    adaptive_loops=False,
+    target_window_seconds=TARGET_TIMED_WINDOW_SECONDS,
     on_result=None,
 ):
     results = []
@@ -393,6 +541,8 @@ def run_mtx_batch(
             iters=iters,
             run_cusparse=run_cusparse,
             input_mode=input_mode,
+            adaptive_loops=adaptive_loops,
+            target_window_seconds=target_window_seconds,
         )
         results.append(entry)
         if on_result is not None:
@@ -403,15 +553,16 @@ def run_mtx_batch(
 def _print_spgemm_mtx_header(value_dtype, index_dtype):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
     print("Formats: FlagSparse=CSR SpGEMM(A@B), cuSPARSE=CSR@CSR, PyTorch=sparse.mm.")
-    print("Timing stays in native dtype; Err fields are max relative error vs each baseline.")
-    print("-" * 220)
+    print("Err(PT/CU)=max(|diff|/(atol+rtol*|ref|)); MaxRel=max(|diff|)/max(|ref|).")
+    print("-" * 320)
     print(
         f"{'Matrix':<28} {'Mode':<10} {'A_rows':>7} {'A_cols':>7} {'B_cols':>7} {'NNZ_A':>10} {'NNZ_B':>10} {'NNZ_C':>10} "
         f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
-        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10} "
+        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Status':>13} {'RefCode':>14} "
+        f"{'Err(PT)':>10} {'Err(CU)':>10} {'MaxAbs(PT)':>12} {'MaxRel(PT)':>12} {'MaxAbs(CU)':>12} {'MaxRel(CU)':>12} "
         f"{'Prep(ms)':>9} {'Count(ms)':>10} {'Fill(ms)':>9}"
     )
-    print("-" * 220)
+    print("-" * 320)
 
 
 def _print_spgemm_mtx_row(entry):
@@ -423,15 +574,16 @@ def _print_spgemm_mtx_row(entry):
         f"{entry['nnz_a']:>10} {entry['nnz_b']:>10} {str(entry['nnz_c'] if entry['nnz_c'] is not None else 'N/A'):>10} "
         f"{_fmt_ms(entry.get('triton_ms')):>14} {_fmt_ms(entry.get('cusparse_ms')):>13} {_fmt_ms(entry.get('pytorch_ms')):>11} "
         f"{_fmt_speedup(entry.get('cusparse_ms'), entry.get('triton_ms')):>7} {_fmt_speedup(entry.get('pytorch_ms'), entry.get('triton_ms')):>7} "
-        f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_fmt_check(entry.get('triton_ok_cu')):>6} "
+        f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_fmt_check(entry.get('triton_ok_cu')):>6} {entry.get('status', 'N/A'):>13} {str(entry.get('ref_reason_code') or 'N/A'):>14} "
         f"{_fmt_err(entry.get('err_pt')):>10} {_fmt_err(entry.get('err_cu')):>10} "
+        f"{_fmt_err(entry.get('max_abs_err_pt')):>12} {_fmt_err(entry.get('max_rel_err_pt')):>12} {_fmt_err(entry.get('max_abs_err_cu')):>12} {_fmt_err(entry.get('max_rel_err_cu')):>12} "
         f"{_fmt_ms(entry.get('prepare_ms')):>9} {_fmt_ms(entry.get('count_ms')):>10} {_fmt_ms(entry.get('fill_ms')):>9}"
     )
     err = entry.get("error")
     if err:
         msg = str(err).replace("\n", " ")
-        if len(msg) > 220:
-            msg = msg[:217] + "..."
+        if len(msg) > 320:
+            msg = msg[:317] + "..."
         print(f"  NOTE: {msg}")
 
 
@@ -439,7 +591,7 @@ def print_mtx_results(results, value_dtype, index_dtype):
     _print_spgemm_mtx_header(value_dtype, index_dtype)
     for entry in results:
         _print_spgemm_mtx_row(entry)
-    print("-" * 220)
+    print("-" * 320)
 
 
 def run_all_dtypes_export_csv(
@@ -449,6 +601,8 @@ def run_all_dtypes_export_csv(
     iters=ITERS,
     run_cusparse=True,
     input_mode=DEFAULT_INPUT_MODE,
+    adaptive_loops=False,
+    target_window_seconds=TARGET_TIMED_WINDOW_SECONDS,
 ):
     csv_path = _normalize_csv_path(csv_path)
     rows = []
@@ -464,9 +618,11 @@ def run_all_dtypes_export_csv(
                 iters=iters,
                 run_cusparse=run_cusparse,
                 input_mode=input_mode,
+                adaptive_loops=adaptive_loops,
+                target_window_seconds=target_window_seconds,
                 on_result=_print_spgemm_mtx_row,
             )
-            print("-" * 220)
+            print("-" * 320)
             for entry in results:
                 n_rows, n_cols = entry["shape"]
                 rows.append(
@@ -483,8 +639,15 @@ def run_all_dtypes_export_csv(
                         "pt_status": _status_label(entry.get("triton_ok_pt")),
                         "cu_status": _status_label(entry.get("triton_ok_cu")),
                         "status": entry.get("status"),
+                        "ref_reason_code": entry.get("ref_reason_code"),
                         "err_pt": entry.get("err_pt"),
                         "err_cu": entry.get("err_cu"),
+                        "max_abs_err_pt": entry.get("max_abs_err_pt"),
+                        "max_rel_err_pt": entry.get("max_rel_err_pt"),
+                        "max_abs_err_cu": entry.get("max_abs_err_cu"),
+                        "max_rel_err_cu": entry.get("max_rel_err_cu"),
+                        "pytorch_reason": entry.get("pytorch_reason"),
+                        "cusparse_reason": entry.get("cusparse_reason"),
                         "error": entry.get("error"),
                         "nnz_a": entry.get("nnz_a"),
                         "nnz_b": entry.get("nnz_b"),
@@ -495,6 +658,8 @@ def run_all_dtypes_export_csv(
                         "prepare_ms": entry.get("prepare_ms"),
                         "count_ms": entry.get("count_ms"),
                         "fill_ms": entry.get("fill_ms"),
+                        "triton_started": entry.get("triton_started"),
+                        "ref_started": entry.get("ref_started"),
                         "effective_warmup": entry.get("effective_warmup"),
                         "effective_iters": entry.get("effective_iters"),
                     }
@@ -502,9 +667,12 @@ def run_all_dtypes_export_csv(
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms",
-        "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
+        "pt_status", "cu_status", "status", "ref_reason_code", "err_pt", "err_cu",
+        "max_abs_err_pt", "max_rel_err_pt", "max_abs_err_cu", "max_rel_err_cu",
+        "pytorch_reason", "cusparse_reason", "error",
         "nnz_a", "nnz_b", "nnz_c", "input_mode", "shape_a", "shape_b",
-        "prepare_ms", "count_ms", "fill_ms", "effective_warmup", "effective_iters",
+        "prepare_ms", "count_ms", "fill_ms", "triton_started", "ref_started",
+        "effective_warmup", "effective_iters",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -620,6 +788,17 @@ def main():
     parser.add_argument("--index-dtype", type=str, default="int32", choices=["int32"])
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
+    parser.add_argument(
+        "--adaptive-loops",
+        action="store_true",
+        help="enable adaptive effective_warmup/effective_iters based on first-call runtime",
+    )
+    parser.add_argument(
+        "--target-window-seconds",
+        type=float,
+        default=TARGET_TIMED_WINDOW_SECONDS,
+        help="adaptive target runtime window per matrix (only used with --adaptive-loops)",
+    )
     parser.add_argument("--no-cusparse", action="store_true")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument(
@@ -666,7 +845,7 @@ def main():
         print("=" * 120)
         print(
             f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  "
-            f"input_mode: {args.input_mode}  |  CSV: {csv_path}"
+            f"input_mode: {args.input_mode}  |  adaptive_loops: {args.adaptive_loops}  |  CSV: {csv_path}"
         )
         run_all_dtypes_export_csv(
             paths,
@@ -675,6 +854,8 @@ def main():
             iters=args.iters,
             run_cusparse=not args.no_cusparse,
             input_mode=args.input_mode,
+            adaptive_loops=args.adaptive_loops,
+            target_window_seconds=args.target_window_seconds,
         )
         return
 
@@ -684,7 +865,7 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  warmup: {args.warmup}  "
-        f"iters: {args.iters}  input_mode: {args.input_mode}"
+        f"iters: {args.iters}  adaptive_loops: {args.adaptive_loops}  input_mode: {args.input_mode}"
     )
     print()
     results = run_mtx_batch(
@@ -695,6 +876,8 @@ def main():
         iters=args.iters,
         run_cusparse=not args.no_cusparse,
         input_mode=args.input_mode,
+        adaptive_loops=args.adaptive_loops,
+        target_window_seconds=args.target_window_seconds,
     )
     print_mtx_results(results, value_dtype, index_dtype)
 
