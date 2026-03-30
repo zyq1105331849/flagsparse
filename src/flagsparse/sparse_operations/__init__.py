@@ -35,7 +35,13 @@ from .spmv_coo import (
     flagsparse_spmv_coo,
     prepare_spmv_coo,
 )
-from .spmm_csr import flagsparse_spmm_csr
+from .spmm_csr import (
+    PreparedCsrSpmmOpt,
+    benchmark_spmm_opt_case,
+    flagsparse_spmm_csr,
+    flagsparse_spmm_csr_opt,
+    prepare_spmm_csr_opt,
+)
 from .spmm_coo import flagsparse_spmm_coo
 from .spgemm_csr import SpGEMMPrepared, flagsparse_spgemm_csr, prepare_spgemm_csr
 from .sddmm_csr import SDDMMPrepared, flagsparse_sddmm_csr, prepare_sddmm_csr
@@ -44,6 +50,7 @@ from .spsv import flagsparse_spsv_coo, flagsparse_spsv_csr
 __all__ = [
     "PreparedCoo",
     "PreparedCsrSpmv",
+    "PreparedCsrSpmmOpt",
     "SDDMMPrepared",
     "SpGEMMPrepared",
     "SUPPORTED_INDEX_DTYPES",
@@ -54,6 +61,7 @@ __all__ = [
     "benchmark_sddmm_case",
     "benchmark_spgemm_case",
     "benchmark_spmm_case",
+    "benchmark_spmm_opt_case",
     "benchmark_spmv_case",
     "comprehensive_gather_test",
     "comprehensive_scatter_test",
@@ -65,6 +73,7 @@ __all__ = [
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
     "flagsparse_spmm_csr",
+    "flagsparse_spmm_csr_opt",
     "flagsparse_spmv_coo",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csr",
@@ -75,6 +84,7 @@ __all__ = [
     "prepare_sddmm_csr",
     "prepare_spgemm_csr",
     "prepare_spmv_csr",
+    "prepare_spmm_csr_opt",
     "pytorch_index_gather",
     "pytorch_index_scatter",
     "triton_cusparse_gather",

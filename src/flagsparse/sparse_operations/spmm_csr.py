@@ -194,13 +194,11 @@ def _spmm_csr_complex_kernel(
         mask=mask_n,
     )
 
-def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
+def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     if len(shape) != 2:
         raise ValueError("shape must be a 2-tuple: (n_rows, n_cols)")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
         raise ValueError("data, indices, and indptr must be 1D tensors")
-    if B.ndim != 2:
-        raise ValueError("B must be a 2D dense tensor")
 
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if n_rows < 0 or n_cols < 0:
@@ -211,19 +209,15 @@ def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
         )
     if data.numel() != indices.numel():
         raise ValueError("data and indices must have the same length (nnz)")
-    if B.shape[0] != n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={n_cols}, got {B.shape[0]}")
 
-    if not all(t.is_cuda for t in (data, indices, indptr, B)):
-        raise ValueError("data, indices, indptr, and B must be CUDA tensors")
-    if not all(t.device == data.device for t in (indices, indptr, B)):
-        raise ValueError("data, indices, indptr, and B must be on the same CUDA device")
+    if not all(t.is_cuda for t in (data, indices, indptr)):
+        raise ValueError("data, indices, and indptr must be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr)):
+        raise ValueError("data, indices, and indptr must be on the same CUDA device")
     if data.dtype not in SUPPORTED_SPMM_VALUE_DTYPES:
         raise TypeError(
             "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
         )
-    if B.dtype != data.dtype:
-        raise TypeError("B dtype must match data dtype")
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
     if indptr.dtype not in SUPPORTED_INDEX_DTYPES:
@@ -249,10 +243,41 @@ def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
     data = data.contiguous()
     indices = indices.contiguous()
     indptr = indptr.contiguous()
-    B = B.contiguous()
 
     kernel_indices = indices.to(torch.int32) if indices.dtype == torch.int64 else indices
     kernel_indptr = indptr.to(torch.int64)
+    row_lengths = (
+        kernel_indptr[1:] - kernel_indptr[:-1]
+        if n_rows > 0
+        else kernel_indptr.new_empty((0,))
+    )
+    max_row_nnz = int(row_lengths.max().item()) if n_rows > 0 else 0
+    return data, kernel_indices, kernel_indptr, n_rows, n_cols, row_lengths, max_row_nnz
+
+
+def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+
+    (
+        data,
+        kernel_indices,
+        kernel_indptr,
+        n_rows,
+        n_cols,
+        _row_lengths,
+        _max_row_nnz,
+    ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
+    if B.shape[0] != n_cols:
+        raise ValueError(f"B.shape[0] must be n_cols={n_cols}, got {B.shape[0]}")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != data.device:
+        raise ValueError("B must be on the same CUDA device as the sparse matrix")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match data dtype")
+
+    B = B.contiguous()
     return data, kernel_indices, kernel_indptr, B, n_rows, n_cols, int(B.shape[1])
 
 
@@ -307,6 +332,194 @@ def _resolve_spmm_alg1_launch_config(
         "max_row_nnz": int(max_row_nnz),
         "auto_max_segments": max_segments is None,
     }
+
+
+class PreparedCsrSpmmOpt:
+    """Cached CSR metadata for repeated native SpMM-opt calls on the same sparse matrix."""
+
+    __slots__ = (
+        "data",
+        "kernel_indices",
+        "kernel_indptr",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "row_lengths",
+        "max_row_nnz",
+        "row_buckets",
+        "supports_opt",
+        "long_part_rows",
+        "long_part_starts",
+        "long_part_ends",
+        "long_row_ids",
+        "long_row_part_ptr",
+        "long_row_fallback_only",
+    )
+
+    def __init__(
+        self,
+        data,
+        kernel_indices,
+        kernel_indptr,
+        shape,
+        n_rows,
+        n_cols,
+        row_lengths,
+        max_row_nnz,
+        row_buckets,
+        long_part_rows,
+        long_part_starts,
+        long_part_ends,
+        long_row_ids,
+        long_row_part_ptr,
+        long_row_fallback_only,
+    ):
+        self.data = data
+        self.kernel_indices = kernel_indices
+        self.kernel_indptr = kernel_indptr
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows = int(n_rows)
+        self.n_cols = int(n_cols)
+        self.row_lengths = row_lengths
+        self.max_row_nnz = int(max_row_nnz)
+        self.row_buckets = row_buckets
+        self.supports_opt = data.dtype in (torch.float32, torch.float64)
+        self.long_part_rows = long_part_rows
+        self.long_part_starts = long_part_starts
+        self.long_part_ends = long_part_ends
+        self.long_row_ids = long_row_ids
+        self.long_row_part_ptr = long_row_part_ptr
+        self.long_row_fallback_only = bool(long_row_fallback_only)
+
+
+_SPMM_OPT_BUCKET_SPECS = (
+    {"max_row_nnz": 32, "kind": "batched", "batch_rows": 8, "block_nnz": 32},
+    {"max_row_nnz": 128, "kind": "batched", "batch_rows": 4, "block_nnz": 64},
+    {"max_row_nnz": 512, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
+    {"max_row_nnz": 2048, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
+    {"max_row_nnz": None, "kind": "split", "batch_rows": 1, "block_nnz": 256},
+)
+_SPMM_OPT_LONG_ROW_THRESHOLD = 2048
+
+
+def _select_spmm_opt_block_n(n_dense_cols):
+    if n_dense_cols <= 8:
+        return 8
+    if n_dense_cols <= 16:
+        return 16
+    if n_dense_cols <= 32:
+        return 32
+    if n_dense_cols <= 64:
+        return 64
+    return 128
+
+
+def _build_spmm_opt_split_metadata(kernel_indptr, long_rows, part_block_nnz):
+    device = kernel_indptr.device
+    row_values = []
+    part_starts = []
+    part_ends = []
+    row_part_ptr = [0]
+    long_rows_cpu = long_rows.to(torch.int64).cpu().tolist()
+    indptr_cpu = kernel_indptr.to(torch.int64).cpu().tolist()
+    for row in long_rows_cpu:
+        start = int(indptr_cpu[row])
+        end = int(indptr_cpu[row + 1])
+        cursor = start
+        while cursor < end:
+            row_values.append(row)
+            part_starts.append(cursor)
+            cursor = min(cursor + int(part_block_nnz), end)
+            part_ends.append(cursor)
+        row_part_ptr.append(len(row_values))
+    row_dtype = long_rows.dtype if long_rows.numel() > 0 else torch.int32
+    return (
+        torch.tensor(row_values, dtype=row_dtype, device=device),
+        torch.tensor(part_starts, dtype=torch.int64, device=device),
+        torch.tensor(part_ends, dtype=torch.int64, device=device),
+        torch.tensor(row_part_ptr, dtype=torch.int64, device=device),
+    )
+
+
+def _build_spmm_opt_buckets(row_lengths):
+    device = row_lengths.device
+    max_row_index = int(row_lengths.numel()) - 1
+    row_index_dtype = (
+        torch.int32 if max_row_index <= _INDEX_LIMIT_INT32 else torch.int64
+    )
+    buckets = []
+    lower = 0
+    long_rows = torch.empty((0,), dtype=row_index_dtype, device=device)
+    for spec in _SPMM_OPT_BUCKET_SPECS:
+        upper = spec["max_row_nnz"]
+        if upper is None:
+            mask = row_lengths > lower
+        elif lower == 0:
+            mask = row_lengths <= upper
+        else:
+            mask = (row_lengths > lower) & (row_lengths <= upper)
+        rows = torch.nonzero(mask, as_tuple=False).flatten().to(row_index_dtype)
+        if rows.numel() == 0:
+            if upper is not None:
+                lower = upper
+            continue
+        bucket = {
+            "kind": spec["kind"],
+            "rows": rows,
+            "batch_rows": int(spec["batch_rows"]),
+            "block_nnz": int(spec["block_nnz"]),
+        }
+        buckets.append(bucket)
+        if spec["kind"] == "split":
+            long_rows = rows
+        if upper is not None:
+            lower = upper
+    return buckets, long_rows
+
+
+def prepare_spmm_csr_opt(data, indices, indptr, shape):
+    (
+        data,
+        kernel_indices,
+        kernel_indptr,
+        n_rows,
+        n_cols,
+        row_lengths,
+        max_row_nnz,
+    ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
+    row_buckets, long_rows = _build_spmm_opt_buckets(row_lengths)
+    long_part_rows = torch.empty((0,), dtype=long_rows.dtype, device=data.device)
+    long_part_starts = torch.empty((0,), dtype=torch.int64, device=data.device)
+    long_part_ends = torch.empty((0,), dtype=torch.int64, device=data.device)
+    long_row_part_ptr = torch.zeros(1, dtype=torch.int64, device=data.device)
+    if long_rows.numel() > 0:
+        (
+            long_part_rows,
+            long_part_starts,
+            long_part_ends,
+            long_row_part_ptr,
+        ) = _build_spmm_opt_split_metadata(
+            kernel_indptr,
+            long_rows,
+            part_block_nnz=256,
+        )
+    return PreparedCsrSpmmOpt(
+        data=data,
+        kernel_indices=kernel_indices,
+        kernel_indptr=kernel_indptr,
+        shape=shape,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        row_lengths=row_lengths,
+        max_row_nnz=max_row_nnz,
+        row_buckets=row_buckets,
+        long_part_rows=long_part_rows,
+        long_part_starts=long_part_starts,
+        long_part_ends=long_part_ends,
+        long_row_ids=long_rows,
+        long_row_part_ptr=long_row_part_ptr,
+        long_row_fallback_only=False,
+    )
 
 
 def _triton_spmm_csr_impl(
@@ -385,6 +598,462 @@ def _triton_spmm_csr_impl(
     )
     return torch.view_as_complex(C_ri.contiguous())
 
+
+@triton.jit
+def _spmm_csr_batched_rows_f32_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BATCH: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    for batch_idx in tl.static_range(0, BATCH):
+        ridx = pid_row * BATCH + batch_idx
+        active = ridx < n_bucket_rows
+        row = tl.load(rows_ptr + ridx, mask=active, other=0)
+        start = tl.load(indptr_ptr + row, mask=active, other=0)
+        end = tl.load(indptr_ptr + row + 1, mask=active, other=0)
+        row_nnz = end - start
+        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = start + chunk_start + kk
+                valid = active & (idx < end)
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                acc = acc + a_val * b_vals
+        tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n & active)
+
+
+@triton.jit
+def _spmm_csr_batched_rows_f64_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BATCH: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    for batch_idx in tl.static_range(0, BATCH):
+        ridx = pid_row * BATCH + batch_idx
+        active = ridx < n_bucket_rows
+        row = tl.load(rows_ptr + ridx, mask=active, other=0)
+        start = tl.load(indptr_ptr + row, mask=active, other=0)
+        end = tl.load(indptr_ptr + row + 1, mask=active, other=0)
+        row_nnz = end - start
+        acc = tl.zeros([BLOCK_N], dtype=tl.float64)
+        for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = start + chunk_start + kk
+                valid = active & (idx < end)
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                acc = acc + a_val * b_vals
+        tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n & active)
+
+
+@triton.jit
+def _spmm_csr_vector_rows_f32_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+    row = tl.load(rows_ptr + pid_row)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+        for kk in tl.static_range(0, BLOCK_NNZ):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_vals = tl.load(
+                b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            acc = acc + a_val * b_vals
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_vector_rows_f64_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+    row = tl.load(rows_ptr + pid_row)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    acc = tl.zeros([BLOCK_N], dtype=tl.float64)
+    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+        for kk in tl.static_range(0, BLOCK_NNZ):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_vals = tl.load(
+                b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            acc = acc + a_val * b_vals
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_split_part_f32_kernel(
+    data_ptr,
+    indices_ptr,
+    b_ptr,
+    workspace_ptr,
+    part_starts_ptr,
+    part_ends_ptr,
+    n_parts,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_wm,
+    stride_wn,
+    BLOCK_N: tl.constexpr,
+):
+    pid_part = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_part >= n_parts:
+        return
+    start = tl.load(part_starts_ptr + pid_part)
+    end = tl.load(part_ends_ptr + pid_part)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for idx in tl.range(start, end):
+        a_val = tl.load(data_ptr + idx)
+        a_col = tl.load(indices_ptr + idx)
+        b_vals = tl.load(
+            b_ptr + a_col * stride_bk + offs_n * stride_bn,
+            mask=mask_n,
+            other=0.0,
+        )
+        acc = acc + a_val * b_vals
+    tl.store(workspace_ptr + pid_part * stride_wm + offs_n * stride_wn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_split_part_f64_kernel(
+    data_ptr,
+    indices_ptr,
+    b_ptr,
+    workspace_ptr,
+    part_starts_ptr,
+    part_ends_ptr,
+    n_parts,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_wm,
+    stride_wn,
+    BLOCK_N: tl.constexpr,
+):
+    pid_part = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_part >= n_parts:
+        return
+    start = tl.load(part_starts_ptr + pid_part)
+    end = tl.load(part_ends_ptr + pid_part)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    acc = tl.zeros([BLOCK_N], dtype=tl.float64)
+    for idx in tl.range(start, end):
+        a_val = tl.load(data_ptr + idx)
+        a_col = tl.load(indices_ptr + idx)
+        b_vals = tl.load(
+            b_ptr + a_col * stride_bk + offs_n * stride_bn,
+            mask=mask_n,
+            other=0.0,
+        )
+        acc = acc + a_val * b_vals
+    tl.store(workspace_ptr + pid_part * stride_wm + offs_n * stride_wn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_split_reduce_f32_kernel(
+    workspace_ptr,
+    out_ptr,
+    long_rows_ptr,
+    row_part_ptr_ptr,
+    n_long_rows,
+    n_dense_cols,
+    stride_wm,
+    stride_wn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_long_rows:
+        return
+    row = tl.load(long_rows_ptr + pid_row)
+    part_start = tl.load(row_part_ptr_ptr + pid_row)
+    part_end = tl.load(row_part_ptr_ptr + pid_row + 1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for rel_part in tl.range(0, part_end - part_start):
+        part_id = part_start + rel_part
+        vals = tl.load(
+            workspace_ptr + part_id * stride_wm + offs_n * stride_wn,
+            mask=mask_n,
+            other=0.0,
+        )
+        acc = acc + vals
+    tl.store(out_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_split_reduce_f64_kernel(
+    workspace_ptr,
+    out_ptr,
+    long_rows_ptr,
+    row_part_ptr_ptr,
+    n_long_rows,
+    n_dense_cols,
+    stride_wm,
+    stride_wn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_long_rows:
+        return
+    row = tl.load(long_rows_ptr + pid_row)
+    part_start = tl.load(row_part_ptr_ptr + pid_row)
+    part_end = tl.load(row_part_ptr_ptr + pid_row + 1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    acc = tl.zeros([BLOCK_N], dtype=tl.float64)
+    for rel_part in tl.range(0, part_end - part_start):
+        part_id = part_start + rel_part
+        vals = tl.load(
+            workspace_ptr + part_id * stride_wm + offs_n * stride_wn,
+            mask=mask_n,
+            other=0.0,
+        )
+        acc = acc + vals
+    tl.store(out_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n):
+    rows = bucket["rows"]
+    if rows.numel() == 0:
+        return
+    dtype = prepared.data.dtype
+    kernel_map = {
+        ("batched", torch.float32): _spmm_csr_batched_rows_f32_kernel,
+        ("batched", torch.float64): _spmm_csr_batched_rows_f64_kernel,
+        ("vector", torch.float32): _spmm_csr_vector_rows_f32_kernel,
+        ("vector", torch.float64): _spmm_csr_vector_rows_f64_kernel,
+    }
+    if bucket["kind"] == "batched":
+        batch_rows = int(bucket["batch_rows"])
+        grid = (triton.cdiv(rows.numel(), batch_rows), triton.cdiv(B.shape[1], block_n))
+        kernel = kernel_map[(bucket["kind"], dtype)]
+        kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BATCH=batch_rows,
+            BLOCK_N=block_n,
+            BLOCK_NNZ=bucket["block_nnz"],
+        )
+        return
+
+    grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
+    kernel = kernel_map[(bucket["kind"], dtype)]
+    kernel[grid](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        rows,
+        rows.numel(),
+        B.shape[1],
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_NNZ=bucket["block_nnz"],
+    )
+
+
+def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n):
+    if prepared.long_part_rows.numel() == 0:
+        return False
+    workspace = torch.empty(
+        (prepared.long_part_rows.numel(), B.shape[1]),
+        dtype=B.dtype,
+        device=B.device,
+    )
+    split_kernel = (
+        _spmm_csr_split_part_f64_kernel
+        if B.dtype == torch.float64
+        else _spmm_csr_split_part_f32_kernel
+    )
+    reduce_kernel = (
+        _spmm_csr_split_reduce_f64_kernel
+        if B.dtype == torch.float64
+        else _spmm_csr_split_reduce_f32_kernel
+    )
+    split_grid = (
+        prepared.long_part_rows.numel(),
+        triton.cdiv(B.shape[1], block_n),
+    )
+    split_kernel[split_grid](
+        prepared.data,
+        prepared.kernel_indices,
+        B,
+        workspace,
+        prepared.long_part_starts,
+        prepared.long_part_ends,
+        prepared.long_part_rows.numel(),
+        B.shape[1],
+        B.stride(0),
+        B.stride(1),
+        workspace.stride(0),
+        workspace.stride(1),
+        BLOCK_N=block_n,
+    )
+    reduce_grid = (
+        prepared.long_row_ids.numel(),
+        triton.cdiv(B.shape[1], block_n),
+    )
+    reduce_kernel[reduce_grid](
+        workspace,
+        C_out,
+        prepared.long_row_ids,
+        prepared.long_row_part_ptr,
+        prepared.long_row_ids.numel(),
+        B.shape[1],
+        workspace.stride(0),
+        workspace.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BLOCK_N=block_n,
+    )
+    return False
+
+
+def _triton_spmm_csr_impl_opt_prepared(prepared, B):
+    if not prepared.supports_opt:
+        raise TypeError("spmm opt only supports float32 and float64")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != prepared.data.device:
+        raise ValueError("B must be on the same CUDA device as the sparse matrix")
+    if B.dtype != prepared.data.dtype:
+        raise TypeError("B dtype must match sparse matrix dtype")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    B = B.contiguous()
+    block_n = _select_spmm_opt_block_n(int(B.shape[1]))
+    C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    long_row_fallback_used = False
+    for bucket in prepared.row_buckets:
+        if bucket["kind"] == "split":
+            long_row_fallback_used = _run_spmm_opt_split_bucket(prepared, B, C_out, block_n)
+            continue
+        _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n)
+    return C_out, long_row_fallback_used
+
 def flagsparse_spmm_csr(
     data,
     indices,
@@ -455,6 +1124,197 @@ def flagsparse_spmm_csr(
     if return_time:
         return C, elapsed_ms
     return C
+
+
+def flagsparse_spmm_csr_opt(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_time=False,
+):
+    """CSR SpMM-opt: native float32/float64 bucketed path for CSR @ dense."""
+    if prepared is not None and not isinstance(prepared, PreparedCsrSpmmOpt):
+        raise TypeError("prepared must be a PreparedCsrSpmmOpt instance")
+    if prepared is None:
+        if any(arg is None for arg in (data, indices, indptr, shape)):
+            raise ValueError(
+                "data, indices, indptr, and shape are required when prepared is not provided"
+            )
+        prepared = prepare_spmm_csr_opt(data, indices, indptr, shape)
+    elif shape is not None:
+        resolved_shape = (int(shape[0]), int(shape[1]))
+        if resolved_shape != prepared.shape:
+            raise ValueError(
+                f"shape {resolved_shape} does not match prepared.shape {prepared.shape}"
+            )
+    if B is None:
+        raise ValueError("B is required")
+    if not prepared.supports_opt:
+        raise TypeError("flagsparse_spmm_csr_opt only supports float32 and float64")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != prepared.data.device:
+        raise ValueError("B must be on the same CUDA device as sparse matrix data")
+    if out is not None:
+        if not out.is_cuda:
+            raise ValueError("out must be a CUDA tensor")
+        if out.device != prepared.data.device:
+            raise ValueError("out must be on the same CUDA device as sparse matrix data")
+        if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
+            raise ValueError("out shape/dtype must match result")
+    t0 = None
+    if return_time:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    C, _long_row_fallback_used = _triton_spmm_csr_impl_opt_prepared(prepared, B)
+    elapsed_ms = None
+    if return_time:
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if return_time:
+        return C, elapsed_ms
+    return C
+
+
+def _spmm_opt_reference_error(candidate, reference, value_dtype):
+    atol, rtol = _spmm_coo_reference_tolerance(value_dtype)
+    if candidate.numel() == 0:
+        return 0.0
+    diff = torch.abs(candidate - reference)
+    denom = atol + rtol * torch.abs(reference)
+    return float(torch.max(diff / denom).item())
+
+
+def benchmark_spmm_opt_case(
+    n_rows=4096,
+    n_cols=4096,
+    nnz=65536,
+    n_dense_cols=32,
+    value_dtype=torch.float32,
+    index_dtype=torch.int32,
+    warmup=20,
+    iters=200,
+    run_cusparse=True,
+):
+    """Benchmark SpMM base vs opt against the same high-precision PyTorch reference."""
+    if value_dtype not in (torch.float32, torch.float64):
+        raise TypeError("benchmark_spmm_opt_case only supports float32 and float64")
+    device = torch.device("cuda")
+    data, indices, indptr = _build_random_csr(
+        n_rows, n_cols, nnz, value_dtype, index_dtype, device
+    )
+    B = _build_random_dense((n_cols, n_dense_cols), value_dtype, device)
+    shape = (n_rows, n_cols)
+    prepared = prepare_spmm_csr_opt(data, indices, indptr, shape)
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    base_values = flagsparse_spmm_csr(data, indices, indptr, B, shape)
+    torch.cuda.synchronize()
+    base_first_call_ms = (time.perf_counter() - t0) * 1000.0
+    base_values, base_ms = _benchmark_cuda_op(
+        lambda: flagsparse_spmm_csr(data, indices, indptr, B, shape),
+        warmup=warmup,
+        iters=iters,
+    )
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    opt_values = flagsparse_spmm_csr_opt(B=B, prepared=prepared)
+    torch.cuda.synchronize()
+    opt_first_call_ms = (time.perf_counter() - t0) * 1000.0
+    opt_values, opt_ms = _benchmark_cuda_op(
+        lambda: flagsparse_spmm_csr_opt(B=B, prepared=prepared),
+        warmup=warmup,
+        iters=iters,
+    )
+
+    indptr64 = indptr.to(torch.int64)
+    indices64 = indices.to(torch.int64)
+    csr_ref = torch.sparse_csr_tensor(
+        indptr64,
+        indices64,
+        data.to(torch.float64 if value_dtype == torch.float32 else value_dtype),
+        size=shape,
+        device=device,
+    )
+    ref = torch.sparse.mm(
+        csr_ref,
+        B.to(torch.float64 if value_dtype == torch.float32 else value_dtype),
+    ).to(value_dtype)
+
+    pt_ms = None
+    try:
+        pt_sparse = torch.sparse_csr_tensor(
+            indptr64,
+            indices64,
+            data,
+            size=shape,
+            device=device,
+        )
+        pt_op = lambda: torch.sparse.mm(pt_sparse, B)
+        _, pt_ms = _benchmark_cuda_op(pt_op, warmup=warmup, iters=iters)
+    except Exception:
+        pt_ms = None
+
+    cu_ms = None
+    if run_cusparse and cp is not None and cpx_sparse is not None:
+        try:
+            data_cp = _cupy_from_torch(data)
+            indices_cp = _cupy_from_torch(indices.to(torch.int64))
+            indptr_cp = _cupy_from_torch(indptr)
+            B_cp = _cupy_from_torch(B)
+            A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
+            _, cu_ms = _benchmark_cuda_op(lambda: A_csr @ B_cp, warmup=warmup, iters=iters)
+        except Exception:
+            cu_ms = None
+
+    err_base = _spmm_opt_reference_error(base_values, ref, value_dtype)
+    err_opt = _spmm_opt_reference_error(opt_values, ref, value_dtype)
+    return {
+        "parameters": {
+            "n_rows": n_rows,
+            "n_cols": n_cols,
+            "nnz": nnz,
+            "n_dense_cols": n_dense_cols,
+            "value_dtype": str(value_dtype),
+            "index_dtype": str(index_dtype),
+        },
+        "performance": {
+            "base_ms": base_ms,
+            "base_first_call_ms": base_first_call_ms,
+            "opt_ms": opt_ms,
+            "opt_first_call_ms": opt_first_call_ms,
+            "pt_ms": pt_ms,
+            "cu_ms": cu_ms,
+            "opt_vs_base": (base_ms / opt_ms if opt_ms and opt_ms > 0 else None),
+            "opt_vs_pt": (pt_ms / opt_ms if pt_ms is not None and opt_ms > 0 else None),
+            "opt_vs_cu": (cu_ms / opt_ms if cu_ms is not None and opt_ms > 0 else None),
+        },
+        "verification": {
+            "err_base": err_base,
+            "err_opt": err_opt,
+            "base_ok": err_base <= 1.0,
+            "opt_ok": err_opt <= 1.0,
+            "status": ("PASS" if err_opt <= 1.0 else "FAIL"),
+        },
+        "backend_status": {
+            "long_row_fallback_used": bool(prepared.long_row_fallback_only),
+            "flagsparse_internal_route": "csr-opt-bucketed",
+        },
+        "samples": {
+            "base": base_values,
+            "opt": opt_values,
+            "reference": ref,
+        },
+    }
 
 
 def benchmark_spmm_case(
