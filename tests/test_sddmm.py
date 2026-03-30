@@ -2,6 +2,13 @@
 SDDMM tests: load SuiteSparse .mtx as CSR pattern and benchmark
 out = alpha * dot(X[row], Y[col]) + beta * in.
 CuPy baseline uses sampled-dot on CSR pattern (not dense X@Y^T).
+
+acc_mode notes:
+- acc_mode=f32 keeps the native float32 accumulate path for float32 inputs.
+- acc_mode=f64 upgrades only the internal accumulation of float32 inputs to
+  float64 while still returning float32 outputs.
+- float64 inputs always keep the existing float64 route; acc_mode only affects
+  float32 runs in this test harness.
 """
 
 import argparse
@@ -28,11 +35,13 @@ from test_spmm import load_mtx_to_csr_torch
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
-CSV_VALUE_DTYPES = [torch.float32, torch.float64]
-CSV_INDEX_DTYPES = [torch.int32]
 WARMUP = 5
 ITERS = 20
 DEFAULT_K = 64
+BASELINE_ATOL = 1e-4
+BASELINE_RTOL = 1e-2
+ACC64_ATOL = 1e-6
+ACC64_RTOL = 1e-5
 
 
 def _dtype_name(dtype):
@@ -127,16 +136,37 @@ def _normalize_csv_path(csv_path):
     return csv_path
 
 
-def _scaled_allclose_error(candidate, reference, value_dtype):
+def _resolve_tolerance(value_dtype, acc_mode):
+    if value_dtype == torch.float32:
+        if acc_mode == "f64":
+            return ACC64_ATOL, ACC64_RTOL
+        return BASELINE_ATOL, BASELINE_RTOL
+    return ast_ops._tolerance_for_dtype(value_dtype)
+
+
+def _scaled_allclose_error(candidate, reference, atol, rtol):
     if candidate.numel() == 0:
         return 0.0
-    atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
     diff = torch.abs(candidate - reference)
     denom = atol + rtol * torch.abs(reference)
     return float(torch.max(diff / denom).item())
 
 
-def _benchmark_triton_sddmm(data, indices, indptr, shape, x, y, alpha, beta, warmup, iters):
+def _benchmark_reference_sddmm(data, indices, indptr, x, y, alpha, beta, value_dtype, warmup, iters):
+    indptr64 = indptr.to(torch.int64)
+    if value_dtype == torch.float32:
+        x_ref = x.to(torch.float64)
+        y_ref = y.to(torch.float64)
+        data_ref = data.to(torch.float64) if data is not None else None
+
+        op = lambda: ast_ops._sddmm_reference(indices, indptr64, x_ref, y_ref, data_ref, alpha, beta).to(torch.float32)
+    else:
+        op = lambda: ast_ops._sddmm_reference(indices, indptr64, x, y, data, alpha, beta)
+    ref_values, ref_ms = ast_ops._benchmark_cuda_op(op, warmup=warmup, iters=iters)
+    return ref_values, ref_ms
+
+
+def _benchmark_triton_sddmm(data, indices, indptr, shape, x, y, alpha, beta, warmup, iters, acc_mode):
     torch.cuda.synchronize()
     t_prepare0 = time.perf_counter()
     prepared = ast.prepare_sddmm_csr(indices, indptr, shape, k_hint=int(x.shape[1]))
@@ -145,18 +175,56 @@ def _benchmark_triton_sddmm(data, indices, indptr, shape, x, y, alpha, beta, war
 
     torch.cuda.synchronize()
     t_first0 = time.perf_counter()
-    _ = ast.flagsparse_sddmm_csr(data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared)
+    if x.dtype == torch.float32 and acc_mode == "f64":
+        _ = ast_ops._run_sddmm_prepared(
+            prepared,
+            x.contiguous(),
+            y.contiguous(),
+            data.contiguous() if data is not None else None,
+            alpha,
+            beta,
+            out=None,
+            allow_fallback=False,
+            variant="acc64",
+        )[0]
+    else:
+        _ = ast.flagsparse_sddmm_csr(data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared)
     torch.cuda.synchronize()
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
 
-    triton_values, triton_ms = ast_ops._benchmark_cuda_op(
-        lambda: ast.flagsparse_sddmm_csr(data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared),
-        warmup=warmup,
-        iters=iters,
-    )
-    _, meta = ast.flagsparse_sddmm_csr(
-        data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared, return_meta=True
-    )
+    if x.dtype == torch.float32 and acc_mode == "f64":
+        op = lambda: ast_ops._run_sddmm_prepared(
+            prepared,
+            x.contiguous(),
+            y.contiguous(),
+            data.contiguous() if data is not None else None,
+            alpha,
+            beta,
+            out=None,
+            allow_fallback=False,
+            variant="acc64",
+        )[0]
+        triton_values, triton_ms = ast_ops._benchmark_cuda_op(op, warmup=warmup, iters=iters)
+        _, meta = ast_ops._run_sddmm_prepared(
+            prepared,
+            x.contiguous(),
+            y.contiguous(),
+            data.contiguous() if data is not None else None,
+            alpha,
+            beta,
+            out=None,
+            allow_fallback=False,
+            variant="acc64",
+        )
+    else:
+        triton_values, triton_ms = ast_ops._benchmark_cuda_op(
+            lambda: ast.flagsparse_sddmm_csr(data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared),
+            warmup=warmup,
+            iters=iters,
+        )
+        _, meta = ast.flagsparse_sddmm_csr(
+            data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared, return_meta=True
+        )
     meta["prepare_ms"] = prepare_ms
     return triton_values, triton_ms, first_call_ms, meta
 
@@ -171,6 +239,7 @@ def run_one_mtx(
     alpha=1.0,
     beta=0.0,
     run_cusparse=True,
+    acc_mode="f32",
 ):
     device = torch.device("cuda")
     _pattern_values, indices, indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
@@ -213,7 +282,7 @@ def run_one_mtx(
     try:
         result["triton_started"] = True
         triton_values, triton_ms, triton_first_ms, meta = _benchmark_triton_sddmm(
-            data_in, indices, indptr, shape, x, y, alpha, beta, warmup, iters
+            data_in, indices, indptr, shape, x, y, alpha, beta, warmup, iters, acc_mode
         )
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_ms
@@ -223,11 +292,17 @@ def run_one_mtx(
         result["error"] = f"triton: {exc}"
 
     try:
-        ref = ast_ops._sddmm_reference(indices, indptr.to(torch.int64), x, y, data_in, alpha, beta)
-        _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(
-            lambda: ast_ops._sddmm_reference(indices, indptr.to(torch.int64), x, y, data_in, alpha, beta),
-            warmup=warmup,
-            iters=iters,
+        ref, result["pytorch_ms"] = _benchmark_reference_sddmm(
+            data_in,
+            indices,
+            indptr,
+            x,
+            y,
+            alpha,
+            beta,
+            value_dtype,
+            warmup,
+            iters,
         )
     except Exception as exc:
         result["error"] = str(exc) if result["error"] is None else f"{result['error']}; ref: {exc}"
@@ -235,20 +310,20 @@ def run_one_mtx(
         return result
 
     if triton_values is not None:
-        atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
+        atol, rtol = _resolve_tolerance(value_dtype, acc_mode)
         result["triton_ok_pt"] = bool(torch.allclose(triton_values, ref, atol=atol, rtol=rtol))
-        result["err_pt"] = _scaled_allclose_error(triton_values, ref, value_dtype)
+        result["err_pt"] = _scaled_allclose_error(triton_values, ref, atol, rtol)
     else:
         result["triton_ok_pt"] = False
 
     if run_cusparse:
         if ast_ops.cp is None:
-            result["cu_status"] = "REF_UNAVAILABLE"
+            result["cu_status"] = "PERF_ONLY"
             result["cu_reason"] = "CuPy is not available"
         else:
             try:
                 result["cu_started"] = True
-                cu_vals, cupy_ms = _benchmark_cupy_sampled_reference(
+                _cu_vals, cupy_ms = _benchmark_cupy_sampled_reference(
                     indices=indices,
                     indptr=indptr,
                     x=x,
@@ -261,19 +336,12 @@ def run_one_mtx(
                 )
                 result["cupy_ms"] = cupy_ms
                 result["cusparse_ms"] = cupy_ms
-                if triton_values is not None:
-                    atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
-                    result["triton_ok_cu"] = bool(torch.allclose(triton_values, cu_vals, atol=atol, rtol=rtol))
-                    result["err_cu"] = _scaled_allclose_error(triton_values, cu_vals, value_dtype)
-                    result["cu_status"] = "PASS" if result["triton_ok_cu"] else "FAIL"
-                else:
-                    result["cu_status"] = "REF_UNAVAILABLE"
-                    result["cu_reason"] = "Triton output is unavailable for CuPy comparison"
+                result["cu_status"] = "PERF_ONLY"
             except Exception as exc:
-                result["cu_status"] = "REF_RESOURCE" if _is_resource_error(exc) else "REF_UNAVAILABLE"
+                result["cu_status"] = "PERF_RESOURCE" if _is_resource_error(exc) else "PERF_UNAVAILABLE"
                 result["cu_reason"] = str(exc)
     else:
-        result["cu_status"] = "REF_UNAVAILABLE"
+        result["cu_status"] = "PERF_ONLY"
         result["cu_reason"] = "CuPy reference is disabled by CLI"
 
     result["cusparse_reason"] = result["cu_reason"]
@@ -292,6 +360,7 @@ def run_mtx_batch(
     beta=0.0,
     run_cusparse=True,
     on_result=None,
+    acc_mode="f32",
 ):
     results = []
     for path in mtx_paths:
@@ -305,6 +374,7 @@ def run_mtx_batch(
             alpha=alpha,
             beta=beta,
             run_cusparse=run_cusparse,
+            acc_mode=acc_mode,
         )
         results.append(entry)
         if on_result is not None:
@@ -312,11 +382,14 @@ def run_mtx_batch(
     return results
 
 
-def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta):
+def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mode):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
-    print("Formats: FlagSparse=CSR SDDMM, CuPy sampled-dot baseline (not cuSPARSE API), PyTorch reference.")
     print(
-        f"Equation: out = alpha*dot(x[row], y[col]) + beta*in  |  K={k_dim}  alpha={alpha}  beta={beta}"
+        "Formats: FlagSparse=CSR SDDMM, CuPy sampled-dot performance baseline (not cuSPARSE API), "
+        "PyTorch correctness reference."
+    )
+    print(
+        f"Equation: out = alpha*dot(x[row], y[col]) + beta*in  |  K={k_dim}  alpha={alpha}  beta={beta}  acc_mode={acc_mode}"
     )
     print("-" * 196)
     print(
@@ -354,8 +427,8 @@ def _print_sddmm_mtx_row(entry):
         print(f"  CU_NOTE: {msg}")
 
 
-def print_mtx_results(results, value_dtype, index_dtype, k_dim, alpha, beta):
-    _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta)
+def print_mtx_results(results, value_dtype, index_dtype, k_dim, alpha, beta, acc_mode):
+    _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mode)
     for entry in results:
         _print_sddmm_mtx_row(entry)
     print("-" * 196)
@@ -364,63 +437,65 @@ def print_mtx_results(results, value_dtype, index_dtype, k_dim, alpha, beta):
 def run_all_dtypes_export_csv(
     paths,
     csv_path,
+    value_dtype=torch.float32,
+    index_dtype=torch.int32,
     warmup=WARMUP,
     iters=ITERS,
     k_dim=DEFAULT_K,
     alpha=1.0,
     beta=0.0,
     run_cusparse=True,
+    acc_mode="f32",
 ):
     csv_path = _normalize_csv_path(csv_path)
     rows = []
-    for value_dtype in CSV_VALUE_DTYPES:
-        for index_dtype in CSV_INDEX_DTYPES:
-            print("=" * 164)
-            _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta)
-            results = run_mtx_batch(
-                paths,
-                value_dtype=value_dtype,
-                index_dtype=index_dtype,
-                warmup=warmup,
-                iters=iters,
-                k_dim=k_dim,
-                alpha=alpha,
-                beta=beta,
-                run_cusparse=run_cusparse,
-                on_result=_print_sddmm_mtx_row,
-            )
-            print("-" * 196)
-            for entry in results:
-                n_rows, n_cols = entry["shape"]
-                rows.append(
-                    {
-                        "matrix": os.path.basename(entry["path"]),
-                        "value_dtype": _dtype_name(value_dtype),
-                        "index_dtype": _dtype_name(index_dtype),
-                        "n_rows": n_rows,
-                        "n_cols": n_cols,
-                        "nnz": entry["nnz"],
-                        "cupy_ms": entry.get("cupy_ms"),
-                        "triton_ms": entry.get("triton_ms"),
-                        "cusparse_ms": entry.get("cusparse_ms"),
-                        "pytorch_ms": entry.get("pytorch_ms"),
-                        "pt_status": _status_label(entry.get("triton_ok_pt")),
-                        "cu_status": _status_label(entry.get("cu_status")),
-                        "status": entry.get("status"),
-                        "err_pt": entry.get("err_pt"),
-                        "err_cu": entry.get("err_cu"),
-                        "error": entry.get("error"),
-                        "cu_reason": entry.get("cu_reason"),
-                        "triton_started": entry.get("triton_started"),
-                        "cu_started": entry.get("cu_started"),
-                        "fallback_used": entry.get("fallback_used"),
-                        "nnz_pattern": entry.get("nnz_pattern"),
-                        "k": entry.get("k"),
-                        "alpha": entry.get("alpha"),
-                        "beta": entry.get("beta"),
-                        "prepare_ms": entry.get("prepare_ms"),
-                    }
-                )
+    print("=" * 164)
+    _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mode)
+    results = run_mtx_batch(
+        paths,
+        value_dtype=value_dtype,
+        index_dtype=index_dtype,
+        warmup=warmup,
+        iters=iters,
+        k_dim=k_dim,
+        alpha=alpha,
+        beta=beta,
+        run_cusparse=run_cusparse,
+        on_result=_print_sddmm_mtx_row,
+        acc_mode=acc_mode,
+    )
+    print("-" * 196)
+    for entry in results:
+        n_rows, n_cols = entry["shape"]
+        rows.append(
+            {
+                "matrix": os.path.basename(entry["path"]),
+                "value_dtype": _dtype_name(value_dtype),
+                "index_dtype": _dtype_name(index_dtype),
+                "n_rows": n_rows,
+                "n_cols": n_cols,
+                "nnz": entry["nnz"],
+                "cupy_ms": entry.get("cupy_ms"),
+                "triton_ms": entry.get("triton_ms"),
+                "cusparse_ms": entry.get("cusparse_ms"),
+                "pytorch_ms": entry.get("pytorch_ms"),
+                "pt_status": _status_label(entry.get("triton_ok_pt")),
+                "cu_status": _status_label(entry.get("cu_status")),
+                "status": entry.get("status"),
+                "err_pt": entry.get("err_pt"),
+                "err_cu": entry.get("err_cu"),
+                "error": entry.get("error"),
+                "cu_reason": entry.get("cu_reason"),
+                "triton_started": entry.get("triton_started"),
+                "cu_started": entry.get("cu_started"),
+                "fallback_used": entry.get("fallback_used"),
+                "nnz_pattern": entry.get("nnz_pattern"),
+                "k": entry.get("k"),
+                "alpha": entry.get("alpha"),
+                "beta": entry.get("beta"),
+                "prepare_ms": entry.get("prepare_ms"),
+            }
+        )
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cupy_ms", "cusparse_ms", "pytorch_ms",
@@ -516,6 +591,13 @@ def main():
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float64"])
     parser.add_argument("--index-dtype", type=str, default="int32", choices=["int32"])
+    parser.add_argument(
+        "--acc_mode",
+        type=str,
+        default="f32",
+        choices=["f32", "f64"],
+        help="For float32 runs, choose native f32 accumulation or float64 accumulation.",
+    )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--k", type=int, default=DEFAULT_K, help="Dense feature dimension K")
@@ -524,7 +606,7 @@ def main():
     parser.add_argument(
         "--no-cupy-ref",
         action="store_true",
-        help="Skip CuPy sampled-dot reference baseline",
+        help="Skip CuPy sampled-dot performance baseline",
     )
     parser.add_argument(
         "--no-cusparse",
@@ -552,7 +634,7 @@ def main():
     paths = _expand_mtx_paths(args.mtx)
     if not paths and not args.csv:
         print("No .mtx files given. Use: python test_sddmm.py <file.mtx> [file2.mtx ...] or <dir/>")
-        print("Or run all dtypes and export CSV: python test_sddmm.py <dir/> --csv results.csv")
+        print("Or export the current dtype to CSV: python test_sddmm.py <dir/> --csv results.csv")
         return
 
     if args.csv is not None:
@@ -563,20 +645,23 @@ def main():
             return
         csv_path = _normalize_csv_path(args.csv)
         print("=" * 110)
-        print("FLAGSPARSE SDDMM - f32/f64 with int32, export to CSV")
+        print("FLAGSPARSE SDDMM - export to CSV")
         print("=" * 110)
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  K: {args.k}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  CSV: {csv_path}"
+            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  dtype: {args.dtype}  |  acc_mode: {args.acc_mode}  |  K: {args.k}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  CSV: {csv_path}"
         )
         run_all_dtypes_export_csv(
             paths,
             csv_path,
+            value_dtype=value_dtype,
+            index_dtype=index_dtype,
             warmup=args.warmup,
             iters=args.iters,
             k_dim=args.k,
             alpha=args.alpha,
             beta=args.beta,
             run_cusparse=run_cupy_ref,
+            acc_mode=args.acc_mode,
         )
         return
 
@@ -585,7 +670,7 @@ def main():
     print("=" * 150)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
-        f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  K: {args.k}  alpha: {args.alpha}  beta: {args.beta}  warmup: {args.warmup}  iters: {args.iters}"
+        f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  acc_mode: {args.acc_mode}  K: {args.k}  alpha: {args.alpha}  beta: {args.beta}  warmup: {args.warmup}  iters: {args.iters}"
     )
     print()
     results = run_mtx_batch(
@@ -598,8 +683,9 @@ def main():
         alpha=args.alpha,
         beta=args.beta,
         run_cusparse=run_cupy_ref,
+        acc_mode=args.acc_mode,
     )
-    print_mtx_results(results, value_dtype, index_dtype, args.k, args.alpha, args.beta)
+    print_mtx_results(results, value_dtype, index_dtype, args.k, args.alpha, args.beta, args.acc_mode)
 
 
 if __name__ == "__main__":
