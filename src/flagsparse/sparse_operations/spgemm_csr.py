@@ -35,6 +35,11 @@ _SPGEMM_BUCKET_MAX_ROWS = {
     _SPGEMM_BUCKET_LONG: 256,
 }
 _SPGEMM_LONG_ROW_SLICE_EXPANDED = 200_000
+_SPGEMM_HASH_CAPACITY_LIMITS = {
+    _SPGEMM_BUCKET_SHORT: 1 << 12,
+    _SPGEMM_BUCKET_MEDIUM: 1 << 16,
+    _SPGEMM_BUCKET_LONG: 1 << 18,
+}
 
 
 class SpGEMMPrepared:
@@ -62,6 +67,12 @@ class SpGEMMPrepared:
         "fill_chunks_by_bucket",
         "long_row_slice_expanded",
         "long_row_slices_host",
+        "short_rows",
+        "medium_rows",
+        "long_rows",
+        "short_symbolic_cols",
+        "short_symbolic_indptr",
+        "short_symbolic_ready",
         "hash_capacity_hint",
         "block_nnz",
     )
@@ -86,6 +97,12 @@ class SpGEMMPrepared:
         fill_chunks_by_bucket,
         long_row_slice_expanded,
         long_row_slices_host,
+        short_rows,
+        medium_rows,
+        long_rows,
+        short_symbolic_cols,
+        short_symbolic_indptr,
+        short_symbolic_ready,
         hash_capacity_hint,
         block_nnz,
     ):
@@ -110,6 +127,12 @@ class SpGEMMPrepared:
         self.fill_chunks_by_bucket = fill_chunks_by_bucket
         self.long_row_slice_expanded = int(long_row_slice_expanded)
         self.long_row_slices_host = long_row_slices_host
+        self.short_rows = short_rows
+        self.medium_rows = medium_rows
+        self.long_rows = long_rows
+        self.short_symbolic_cols = short_symbolic_cols
+        self.short_symbolic_indptr = short_symbolic_indptr
+        self.short_symbolic_ready = bool(short_symbolic_ready)
         self.hash_capacity_hint = int(hash_capacity_hint)
         self.block_nnz = int(block_nnz)
 
@@ -230,6 +253,26 @@ def _estimate_hash_capacity(a_row_work):
     return max(256, cap)
 
 
+def _next_pow2(value):
+    value = max(1, int(value))
+    cap = 1
+    while cap < value:
+        cap <<= 1
+    return cap
+
+
+def _estimate_row_hash_capacity(row_work, n_cols, bucket_id):
+    estimated_unique = min(max(1, int(row_work)), max(1, int(n_cols)))
+    base = 64 if bucket_id == _SPGEMM_BUCKET_SHORT else 256
+    return _next_pow2(max(base, 2 * estimated_unique))
+
+
+def _row_hash_route_allowed(prepared, row, bucket_id):
+    row_work = int(prepared.a_row_work[int(row)].item()) if prepared.a_row_work.numel() > 0 else 0
+    cap = _estimate_row_hash_capacity(row_work, prepared.n_cols, bucket_id)
+    return cap <= _SPGEMM_HASH_CAPACITY_LIMITS[bucket_id]
+
+
 def _build_row_bucket(a_row_work):
     # 0: small, 1: medium, 2: long
     bucket = torch.zeros_like(a_row_work, dtype=torch.int8)
@@ -281,6 +324,19 @@ def _build_long_row_slices_host(a_indptr, a_indices, b_indptr, row_ids, max_expa
     return out
 
 
+def _build_bucket_row_groups(row_bucket, device):
+    short_rows = torch.nonzero(row_bucket == _SPGEMM_BUCKET_SHORT, as_tuple=False).flatten().to(
+        device=device, dtype=torch.int64
+    )
+    medium_rows = torch.nonzero(
+        row_bucket == _SPGEMM_BUCKET_MEDIUM, as_tuple=False
+    ).flatten().to(device=device, dtype=torch.int64)
+    long_rows = torch.nonzero(row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten().to(
+        device=device, dtype=torch.int64
+    )
+    return short_rows, medium_rows, long_rows
+
+
 def prepare_spgemm_csr(
     a_data,
     a_indices,
@@ -318,6 +374,9 @@ def prepare_spgemm_csr(
     if n_rows == 0:
         row_work = torch.empty(0, dtype=torch.int32, device=a_data.device)
         row_bucket = torch.empty(0, dtype=torch.int8, device=a_data.device)
+        short_rows = torch.empty(0, dtype=torch.int64, device=a_data.device)
+        medium_rows = torch.empty(0, dtype=torch.int64, device=a_data.device)
+        long_rows = torch.empty(0, dtype=torch.int64, device=a_data.device)
         hash_capacity_hint = 256
         row_work_ready = True
     elif analyze_rows:
@@ -342,16 +401,19 @@ def prepare_spgemm_csr(
                 cols = a_indices[start:end].to(torch.int64)
                 row_work[row] = torch.sum(b_row_nnz[cols]).to(torch.int32)
         row_bucket = _build_row_bucket(row_work)
+        short_rows, medium_rows, long_rows = _build_bucket_row_groups(row_bucket, a_data.device)
         hash_capacity_hint = 256
         row_work_ready = True
     else:
         row_work = torch.zeros(n_rows, dtype=torch.int32, device=a_data.device)
         row_bucket = torch.zeros(n_rows, dtype=torch.int8, device=a_data.device)
+        short_rows = torch.empty(0, dtype=torch.int64, device=a_data.device)
+        medium_rows = torch.empty(0, dtype=torch.int64, device=a_data.device)
+        long_rows = torch.empty(0, dtype=torch.int64, device=a_data.device)
         hash_capacity_hint = 256
         row_work_ready = False
     long_row_slices_host = {}
     if row_work_ready:
-        long_rows = torch.nonzero(row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten()
         long_row_slices_host = _build_long_row_slices_host(
             a_indptr,
             a_indices,
@@ -378,6 +440,12 @@ def prepare_spgemm_csr(
         fill_chunks_by_bucket=None,
         long_row_slice_expanded=_SPGEMM_LONG_ROW_SLICE_EXPANDED,
         long_row_slices_host=long_row_slices_host,
+        short_rows=short_rows,
+        medium_rows=medium_rows,
+        long_rows=long_rows,
+        short_symbolic_cols=torch.empty(0, dtype=torch.int32, device=a_data.device),
+        short_symbolic_indptr=torch.zeros(short_rows.numel() + 1, dtype=torch.int64, device=a_data.device),
+        short_symbolic_ready=False,
         hash_capacity_hint=hash_capacity_hint,
         block_nnz=block_nnz,
     )
@@ -389,30 +457,55 @@ def _ensure_row_work(prepared):
     if prepared.a_data.numel() == 0 or prepared.b_data.numel() == 0:
         prepared.a_row_work = torch.zeros(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
         prepared.row_bucket = torch.zeros(prepared.n_rows, dtype=torch.int8, device=prepared.a_data.device)
+        prepared.short_rows = torch.nonzero(
+            prepared.row_bucket == _SPGEMM_BUCKET_SHORT, as_tuple=False
+        ).flatten().to(dtype=torch.int64)
+        prepared.medium_rows = torch.nonzero(
+            prepared.row_bucket == _SPGEMM_BUCKET_MEDIUM, as_tuple=False
+        ).flatten().to(dtype=torch.int64)
+        prepared.long_rows = torch.nonzero(
+            prepared.row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False
+        ).flatten().to(dtype=torch.int64)
         prepared.hash_capacity_hint = 256
         prepared.row_work_ready = True
         prepared.long_row_slices_host = {}
+        _clear_short_symbolic_cache(prepared)
         _clear_runtime_schedules(prepared)
         return
     row_work = torch.empty(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
-    _spgemm_row_work_kernel[(prepared.n_rows,)](
-        prepared.a_indptr,
-        prepared.a_indices,
-        prepared.b_indptr,
-        row_work,
-        prepared.n_rows,
-        BLOCK_NNZ=int(prepared.block_nnz),
-    )
+    try:
+        _spgemm_row_work_kernel[(prepared.n_rows,)](
+            prepared.a_indptr,
+            prepared.a_indices,
+            prepared.b_indptr,
+            row_work,
+            prepared.n_rows,
+            BLOCK_NNZ=int(prepared.block_nnz),
+        )
+    except Exception:
+        b_row_nnz = (prepared.b_indptr[1:] - prepared.b_indptr[:-1]).to(torch.int32)
+        for row in range(prepared.n_rows):
+            start = int(prepared.a_indptr[row].item())
+            end = int(prepared.a_indptr[row + 1].item())
+            if end <= start:
+                row_work[row] = 0
+                continue
+            cols = prepared.a_indices[start:end].to(torch.int64)
+            row_work[row] = torch.sum(b_row_nnz[cols]).to(torch.int32)
     prepared.a_row_work = row_work
     prepared.row_bucket = _build_row_bucket(row_work)
-    long_rows = torch.nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten()
+    prepared.short_rows, prepared.medium_rows, prepared.long_rows = _build_bucket_row_groups(
+        prepared.row_bucket,
+        prepared.a_data.device,
+    )
     prepared.long_row_slices_host = _build_long_row_slices_host(
         prepared.a_indptr,
         prepared.a_indices,
         prepared.b_indptr,
-        long_rows,
+        prepared.long_rows,
         prepared.long_row_slice_expanded,
     )
+    _clear_short_symbolic_cache(prepared)
     prepared.hash_capacity_hint = 256
     prepared.row_work_ready = True
     _clear_runtime_schedules(prepared)
@@ -485,6 +578,20 @@ def _clear_fill_schedule(prepared):
     prepared.fill_chunks_by_bucket = None
 
 
+def _clear_short_symbolic_cache(prepared):
+    prepared.short_symbolic_cols = torch.empty(
+        0,
+        dtype=torch.int32,
+        device=prepared.a_data.device,
+    )
+    prepared.short_symbolic_indptr = torch.zeros(
+        prepared.short_rows.numel() + 1,
+        dtype=torch.int64,
+        device=prepared.a_data.device,
+    )
+    prepared.short_symbolic_ready = False
+
+
 def _ensure_bucket_rows(prepared):
     if prepared.bucket_rows is None:
         prepared.bucket_rows = _build_bucket_rows(prepared.row_bucket, prepared.a_data.device)
@@ -530,6 +637,275 @@ def _ensure_fill_chunks(prepared):
         )
     prepared.fill_chunks = _compose_ordered_chunks(prepared.fill_chunks_by_bucket)
     return prepared.fill_chunks_by_bucket
+
+
+def _iter_chunk_rows(row_ids):
+    if isinstance(row_ids, list):
+        return [int(row) for row in row_ids]
+    return row_ids.to(torch.int64).cpu().tolist()
+
+
+def _collect_row_contrib_cols(prepared, row):
+    start = int(prepared.a_indptr[row].item())
+    end = int(prepared.a_indptr[row + 1].item())
+    if end <= start:
+        return torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+    parts = []
+    for a_pos in range(start, end):
+        a_col = int(prepared.a_indices[a_pos].item())
+        b_start = int(prepared.b_indptr[a_col].item())
+        b_end = int(prepared.b_indptr[a_col + 1].item())
+        if b_end > b_start:
+            parts.append(prepared.b_indices[b_start:b_end])
+    if not parts:
+        return torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+    return torch.cat(parts)
+
+
+def _collect_row_contrib_cols_vals(prepared, row):
+    start = int(prepared.a_indptr[row].item())
+    end = int(prepared.a_indptr[row + 1].item())
+    if end <= start:
+        return (
+            torch.empty(0, dtype=torch.int32, device=prepared.a_data.device),
+            torch.empty(0, dtype=prepared.a_data.dtype, device=prepared.a_data.device),
+        )
+    col_parts = []
+    val_parts = []
+    for a_pos in range(start, end):
+        a_col = int(prepared.a_indices[a_pos].item())
+        b_start = int(prepared.b_indptr[a_col].item())
+        b_end = int(prepared.b_indptr[a_col + 1].item())
+        if b_end <= b_start:
+            continue
+        cols = prepared.b_indices[b_start:b_end]
+        vals = prepared.b_data[b_start:b_end] * prepared.a_data[a_pos]
+        col_parts.append(cols)
+        val_parts.append(vals)
+    if not col_parts:
+        return (
+            torch.empty(0, dtype=torch.int32, device=prepared.a_data.device),
+            torch.empty(0, dtype=prepared.a_data.dtype, device=prepared.a_data.device),
+        )
+    return torch.cat(col_parts), torch.cat(val_parts)
+
+
+def _collect_row_slice_contrib_cols(prepared, a_ptr_start, a_ptr_end):
+    if a_ptr_end <= a_ptr_start:
+        return torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+    parts = []
+    for a_pos in range(int(a_ptr_start), int(a_ptr_end)):
+        a_col = int(prepared.a_indices[a_pos].item())
+        b_start = int(prepared.b_indptr[a_col].item())
+        b_end = int(prepared.b_indptr[a_col + 1].item())
+        if b_end > b_start:
+            parts.append(prepared.b_indices[b_start:b_end])
+    if not parts:
+        return torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+    return torch.cat(parts)
+
+
+def _collect_row_slice_contrib_cols_vals(prepared, a_ptr_start, a_ptr_end):
+    if a_ptr_end <= a_ptr_start:
+        return (
+            torch.empty(0, dtype=torch.int32, device=prepared.a_data.device),
+            torch.empty(0, dtype=prepared.a_data.dtype, device=prepared.a_data.device),
+        )
+    col_parts = []
+    val_parts = []
+    for a_pos in range(int(a_ptr_start), int(a_ptr_end)):
+        a_col = int(prepared.a_indices[a_pos].item())
+        b_start = int(prepared.b_indptr[a_col].item())
+        b_end = int(prepared.b_indptr[a_col + 1].item())
+        if b_end <= b_start:
+            continue
+        cols = prepared.b_indices[b_start:b_end]
+        vals = prepared.b_data[b_start:b_end] * prepared.a_data[a_pos]
+        col_parts.append(cols)
+        val_parts.append(vals)
+    if not col_parts:
+        return (
+            torch.empty(0, dtype=torch.int32, device=prepared.a_data.device),
+            torch.empty(0, dtype=prepared.a_data.dtype, device=prepared.a_data.device),
+        )
+    return torch.cat(col_parts), torch.cat(val_parts)
+
+
+def _spgemm_count_row_hash(prepared, row):
+    cols = _collect_row_contrib_cols(prepared, int(row))
+    if cols.numel() == 0:
+        return torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+    return torch.unique(cols, sorted=True)
+
+
+def _accumulate_known_cols(raw_cols, raw_vals, uniq_cols, out_dtype):
+    if uniq_cols.numel() == 0:
+        return uniq_cols, torch.empty(0, dtype=out_dtype, device=raw_vals.device)
+    positions = torch.searchsorted(uniq_cols.to(torch.int64), raw_cols.to(torch.int64))
+    acc_dtype = torch.float64 if out_dtype == torch.float32 else raw_vals.dtype
+    acc = torch.zeros(uniq_cols.numel(), dtype=acc_dtype, device=raw_vals.device)
+    acc.index_add_(0, positions, raw_vals.to(acc_dtype))
+    return uniq_cols, acc.to(out_dtype)
+
+
+def _spgemm_fill_row_hash(prepared, row, cached_cols=None):
+    raw_cols, raw_vals = _collect_row_contrib_cols_vals(prepared, int(row))
+    if raw_cols.numel() == 0:
+        empty_cols = torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+        empty_vals = torch.empty(0, dtype=prepared.a_data.dtype, device=prepared.a_data.device)
+        return empty_cols, empty_vals
+    if cached_cols is not None:
+        return _accumulate_known_cols(raw_cols, raw_vals, cached_cols.to(torch.int32), prepared.a_data.dtype)
+    uniq_cols, inverse = torch.unique(raw_cols.to(torch.int64), sorted=True, return_inverse=True)
+    acc_dtype = torch.float64 if prepared.a_data.dtype == torch.float32 else raw_vals.dtype
+    uniq_vals = torch.zeros(uniq_cols.numel(), dtype=acc_dtype, device=raw_vals.device)
+    uniq_vals.index_add_(0, inverse, raw_vals.to(acc_dtype))
+    return uniq_cols.to(torch.int32), uniq_vals.to(prepared.a_data.dtype)
+
+
+def _spgemm_count_row_slice_hash(prepared, row, a_ptr_start, a_ptr_end):
+    cols = _collect_row_slice_contrib_cols(prepared, a_ptr_start, a_ptr_end)
+    if cols.numel() == 0:
+        return torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+    return torch.unique(cols, sorted=True)
+
+
+def _spgemm_fill_row_slice_hash(prepared, row, a_ptr_start, a_ptr_end):
+    raw_cols, raw_vals = _collect_row_slice_contrib_cols_vals(prepared, a_ptr_start, a_ptr_end)
+    if raw_cols.numel() == 0:
+        empty_cols = torch.empty(0, dtype=torch.int32, device=prepared.a_data.device)
+        empty_vals = torch.empty(0, dtype=prepared.a_data.dtype, device=prepared.a_data.device)
+        return empty_cols, empty_vals
+    uniq_cols, inverse = torch.unique(raw_cols.to(torch.int64), sorted=True, return_inverse=True)
+    acc_dtype = torch.float64 if prepared.a_data.dtype == torch.float32 else raw_vals.dtype
+    uniq_vals = torch.zeros(uniq_cols.numel(), dtype=acc_dtype, device=raw_vals.device)
+    uniq_vals.index_add_(0, inverse, raw_vals.to(acc_dtype))
+    return uniq_cols.to(torch.int32), uniq_vals.to(prepared.a_data.dtype)
+
+
+def _legacy_count_rows_chunk(prepared, bucket_id, row_ids, row_nnz_c):
+    if bucket_id != _SPGEMM_BUCKET_LONG:
+        keys, _ = _expand_rows_contrib(prepared, row_ids, need_values=False)
+        if keys.numel() > 0:
+            uniq_keys = torch.unique(keys, sorted=True)
+            uniq_rows = torch.div(
+                uniq_keys,
+                max(1, prepared.n_cols),
+                rounding_mode="floor",
+            )
+            rows_unique, counts = torch.unique_consecutive(
+                uniq_rows, return_counts=True
+            )
+            row_nnz_c[rows_unique] = counts.to(torch.int64)
+        return 0
+
+    long_row_sliced = 0
+    for row in _iter_chunk_rows(row_ids):
+        slices = _iter_row_a_slices(
+            prepared,
+            int(row),
+            max_expanded=prepared.long_row_slice_expanded,
+        )
+        if len(slices) > 1:
+            long_row_sliced += 1
+        keys_parts = []
+        for a_start, a_end in slices:
+            keys, _ = _expand_single_row_slice_contrib(
+                prepared,
+                int(row),
+                a_start,
+                a_end,
+                need_values=False,
+            )
+            if keys.numel() == 0:
+                continue
+            keys_parts.append(torch.unique(keys, sorted=True))
+        if not keys_parts:
+            row_nnz_c[int(row)] = 0
+            continue
+        uniq_row_keys = torch.unique(torch.cat(keys_parts), sorted=True)
+        row_nnz_c[int(row)] = int(uniq_row_keys.numel())
+    return long_row_sliced
+
+
+def _legacy_fill_rows_chunk(prepared, bucket_id, row_ids, c_indptr, c_data, c_indices):
+    device = prepared.a_data.device
+    if bucket_id != _SPGEMM_BUCKET_LONG:
+        keys, vals = _expand_rows_contrib(prepared, row_ids, need_values=True)
+        if keys.numel() > 0:
+            uniq_keys, uniq_vals = _sort_reduce_pairs(
+                keys,
+                vals,
+                out_dtype=prepared.a_data.dtype,
+            )
+            uniq_rows = torch.div(
+                uniq_keys,
+                max(1, prepared.n_cols),
+                rounding_mode="floor",
+            )
+            uniq_cols = (uniq_keys - uniq_rows * max(1, prepared.n_cols)).to(torch.int32)
+            _, row_counts = torch.unique_consecutive(uniq_rows, return_counts=True)
+            row_offsets = torch.cumsum(row_counts.to(torch.int64), dim=0) - row_counts.to(torch.int64)
+            local_pos = (
+                torch.arange(uniq_keys.numel(), device=device, dtype=torch.int64)
+                - torch.repeat_interleave(row_offsets, row_counts)
+            )
+            dst = c_indptr[uniq_rows] + local_pos
+            c_indices[dst] = uniq_cols
+            c_data[dst] = uniq_vals
+        return 0
+
+    long_row_sliced = 0
+    for row in _iter_chunk_rows(row_ids):
+        row = int(row)
+        slices = _iter_row_a_slices(
+            prepared,
+            row,
+            max_expanded=prepared.long_row_slice_expanded,
+        )
+        if len(slices) > 1:
+            long_row_sliced += 1
+        key_parts = []
+        val_parts = []
+        for a_start, a_end in slices:
+            keys, vals = _expand_single_row_slice_contrib(
+                prepared,
+                row,
+                a_start,
+                a_end,
+                need_values=True,
+            )
+            if keys.numel() == 0:
+                continue
+            uniq_k, uniq_v = _sort_reduce_pairs(
+                keys,
+                vals,
+                out_dtype=prepared.a_data.dtype,
+            )
+            key_parts.append(uniq_k)
+            val_parts.append(uniq_v)
+        row_start = int(c_indptr[row].item())
+        row_end = int(c_indptr[row + 1].item())
+        row_nnz = row_end - row_start
+        if row_nnz == 0:
+            continue
+        if not key_parts:
+            raise RuntimeError(f"row {row} expected nnz={row_nnz} but got empty fill")
+        row_keys = torch.cat(key_parts)
+        row_vals = torch.cat(val_parts)
+        row_keys, row_vals = _sort_reduce_pairs(
+            row_keys,
+            row_vals,
+            out_dtype=prepared.a_data.dtype,
+        )
+        if row_keys.numel() != row_nnz:
+            raise RuntimeError(
+                f"row {row} fill nnz mismatch: expected {row_nnz}, got {row_keys.numel()}"
+            )
+        row_cols = (row_keys - row * max(1, prepared.n_cols)).to(torch.int32)
+        c_indices[row_start:row_end] = row_cols
+        c_data[row_start:row_end] = row_vals
+    return long_row_sliced
 
 
 def _expand_rows_contrib(prepared, row_ids, need_values):
@@ -708,63 +1084,101 @@ def _spgemm_count_phase(prepared, profile=False):
     row_nnz_c = torch.zeros(n_rows, dtype=torch.int64, device=device)
     bucket_ms = {bucket_id: None for bucket_id in _SPGEMM_BUCKET_ORDER}
     long_row_sliced = 0
+    bucket_route = {
+        _SPGEMM_BUCKET_SHORT: "hash",
+        _SPGEMM_BUCKET_MEDIUM: "hash",
+        _SPGEMM_BUCKET_LONG: "hash",
+    }
     chunks_by_bucket = _ensure_count_chunks(prepared)
+    short_cols_parts = []
+    short_indptr_parts = [0]
     for bucket_id in _SPGEMM_BUCKET_ORDER:
         chunks = chunks_by_bucket.get(bucket_id, [])
         for row_ids in chunks:
             if profile:
                 torch.cuda.synchronize()
                 t_bucket0 = time.perf_counter()
-            if bucket_id != _SPGEMM_BUCKET_LONG:
-                keys, _ = _expand_rows_contrib(prepared, row_ids, need_values=False)
-                if keys.numel() > 0:
-                    uniq_keys = torch.unique(keys, sorted=True)
-                    uniq_rows = torch.div(
-                        uniq_keys,
-                        max(1, prepared.n_cols),
-                        rounding_mode="floor",
-                    )
-                    rows_unique, counts = torch.unique_consecutive(
-                        uniq_rows, return_counts=True
-                    )
-                    row_nnz_c[rows_unique] = counts.to(torch.int64)
-            else:
-                for row in row_ids:
-                    slices = _iter_row_a_slices(
-                        prepared,
-                        int(row),
-                        max_expanded=prepared.long_row_slice_expanded,
-                    )
-                    if len(slices) > 1:
-                        long_row_sliced += 1
-                    keys_parts = []
-                    for a_start, a_end in slices:
-                        keys, _ = _expand_single_row_slice_contrib(
+            try:
+                rows_iter = _iter_chunk_rows(row_ids)
+                if any(
+                    not _row_hash_route_allowed(prepared, row, bucket_id)
+                    for row in rows_iter
+                ):
+                    raise RuntimeError("row-hash capacity exceeded safety limit")
+                if bucket_id == _SPGEMM_BUCKET_SHORT:
+                    chunk_short_cols = []
+                    for row in rows_iter:
+                        uniq_cols = _spgemm_count_row_hash(prepared, row)
+                        row_nnz_c[int(row)] = int(uniq_cols.numel())
+                        chunk_short_cols.append(uniq_cols)
+                    short_cols_parts.extend(chunk_short_cols)
+                    for uniq_cols in chunk_short_cols:
+                        short_indptr_parts.append(
+                            short_indptr_parts[-1] + int(uniq_cols.numel())
+                        )
+                elif bucket_id == _SPGEMM_BUCKET_MEDIUM:
+                    for row in rows_iter:
+                        uniq_cols = _spgemm_count_row_hash(prepared, row)
+                        row_nnz_c[int(row)] = int(uniq_cols.numel())
+                else:
+                    for row in rows_iter:
+                        slices = _iter_row_a_slices(
                             prepared,
                             int(row),
-                            a_start,
-                            a_end,
-                            need_values=False,
+                            max_expanded=prepared.long_row_slice_expanded,
                         )
-                        if keys.numel() == 0:
+                        if len(slices) > 1:
+                            long_row_sliced += 1
+                        cols_parts = []
+                        for a_start, a_end in slices:
+                            uniq_cols = _spgemm_count_row_slice_hash(
+                                prepared,
+                                int(row),
+                                a_start,
+                                a_end,
+                            )
+                            if uniq_cols.numel() > 0:
+                                cols_parts.append(uniq_cols)
+                        if not cols_parts:
+                            row_nnz_c[int(row)] = 0
                             continue
-                        keys_parts.append(torch.unique(keys, sorted=True))
-                    if not keys_parts:
-                        row_nnz_c[int(row)] = 0
-                        continue
-                    uniq_row_keys = torch.unique(torch.cat(keys_parts), sorted=True)
-                    row_nnz_c[int(row)] = int(uniq_row_keys.numel())
+                        row_cols = torch.unique(torch.cat(cols_parts), sorted=True)
+                        row_nnz_c[int(row)] = int(row_cols.numel())
+            except Exception:
+                bucket_route[bucket_id] = "legacy_sort"
+                long_row_sliced += _legacy_count_rows_chunk(prepared, bucket_id, row_ids, row_nnz_c)
             if profile:
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - t_bucket0) * 1000.0
                 bucket_ms[bucket_id] = (
                     elapsed if bucket_ms[bucket_id] is None else bucket_ms[bucket_id] + elapsed
                 )
+    if bucket_route[_SPGEMM_BUCKET_SHORT] != "hash":
+        _clear_short_symbolic_cache(prepared)
+    elif short_cols_parts:
+        prepared.short_symbolic_cols = torch.cat(short_cols_parts)
+        prepared.short_symbolic_indptr = torch.tensor(
+            short_indptr_parts,
+            dtype=torch.int64,
+            device=prepared.a_data.device,
+        )
+        prepared.short_symbolic_ready = True
+    else:
+        _clear_short_symbolic_cache(prepared)
+        prepared.short_symbolic_ready = True
     meta = {
         "bucket_count_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
         "bucket_count_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
         "bucket_count_ms_long": bucket_ms[_SPGEMM_BUCKET_LONG],
         "long_row_sliced_count_count": int(long_row_sliced),
+        "symbolic_route": (
+            "hash"
+            if all(route == "hash" for route in bucket_route.values())
+            else "legacy_sort"
+        ),
+        "bucket_route_short": bucket_route[_SPGEMM_BUCKET_SHORT],
+        "bucket_route_medium": bucket_route[_SPGEMM_BUCKET_MEDIUM],
+        "bucket_route_long": bucket_route[_SPGEMM_BUCKET_LONG],
     }
     return row_nnz_c, meta
 
@@ -784,12 +1198,21 @@ def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, prof
     )
     bucket_ms = {bucket_id: None for bucket_id in _SPGEMM_BUCKET_ORDER}
     long_row_sliced = 0
+    bucket_route = {
+        _SPGEMM_BUCKET_SHORT: "hash",
+        _SPGEMM_BUCKET_MEDIUM: "hash",
+        _SPGEMM_BUCKET_LONG: "hash",
+    }
     if nnz_c == 0:
         meta = {
             "bucket_fill_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
             "bucket_fill_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
             "bucket_fill_ms_long": bucket_ms[_SPGEMM_BUCKET_LONG],
             "long_row_sliced_count_fill": int(long_row_sliced),
+            "numeric_route": "hash",
+            "bucket_route_short": bucket_route[_SPGEMM_BUCKET_SHORT],
+            "bucket_route_medium": bucket_route[_SPGEMM_BUCKET_MEDIUM],
+            "bucket_route_long": bucket_route[_SPGEMM_BUCKET_LONG],
         }
         return c_data, c_indices, meta
 
@@ -800,79 +1223,103 @@ def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, prof
             if profile:
                 torch.cuda.synchronize()
                 t_bucket0 = time.perf_counter()
-            if bucket_id != _SPGEMM_BUCKET_LONG:
-                keys, vals = _expand_rows_contrib(prepared, row_ids, need_values=True)
-                if keys.numel() > 0:
-                    uniq_keys, uniq_vals = _sort_reduce_pairs(
-                        keys,
-                        vals,
-                        out_dtype=prepared.a_data.dtype,
-                    )
-                    uniq_rows = torch.div(
-                        uniq_keys,
-                        max(1, prepared.n_cols),
-                        rounding_mode="floor",
-                    )
-                    uniq_cols = (uniq_keys - uniq_rows * max(1, prepared.n_cols)).to(torch.int32)
-                    _, row_counts = torch.unique_consecutive(uniq_rows, return_counts=True)
-                    row_offsets = torch.cumsum(row_counts.to(torch.int64), dim=0) - row_counts.to(torch.int64)
-                    local_pos = (
-                        torch.arange(uniq_keys.numel(), device=device, dtype=torch.int64)
-                        - torch.repeat_interleave(row_offsets, row_counts)
-                    )
-                    dst = c_indptr[uniq_rows] + local_pos
-                    c_indices[dst] = uniq_cols
-                    c_data[dst] = uniq_vals
-            else:
-                for row in row_ids:
-                    row = int(row)
-                    slices = _iter_row_a_slices(
-                        prepared,
-                        row,
-                        max_expanded=prepared.long_row_slice_expanded,
-                    )
-                    if len(slices) > 1:
-                        long_row_sliced += 1
-                    key_parts = []
-                    val_parts = []
-                    for a_start, a_end in slices:
-                        keys, vals = _expand_single_row_slice_contrib(
+            try:
+                rows_iter = _iter_chunk_rows(row_ids)
+                if any(
+                    not _row_hash_route_allowed(prepared, row, bucket_id)
+                    for row in rows_iter
+                ):
+                    raise RuntimeError("row-hash capacity exceeded safety limit")
+                if bucket_id == _SPGEMM_BUCKET_SHORT:
+                    if not prepared.short_symbolic_ready:
+                        raise RuntimeError("short symbolic cache is unavailable")
+                    for row in rows_iter:
+                        short_pos = torch.searchsorted(
+                            prepared.short_rows,
+                            torch.tensor([int(row)], dtype=torch.int64, device=prepared.short_rows.device),
+                        )
+                        short_pos = int(short_pos.item())
+                        cache_start = int(prepared.short_symbolic_indptr[short_pos].item())
+                        cache_end = int(prepared.short_symbolic_indptr[short_pos + 1].item())
+                        cached_cols = prepared.short_symbolic_cols[cache_start:cache_end]
+                        row_cols, row_vals = _spgemm_fill_row_hash(prepared, row, cached_cols=cached_cols)
+                        row_start = int(c_indptr[int(row)].item())
+                        row_end = int(c_indptr[int(row) + 1].item())
+                        if row_cols.numel() != (row_end - row_start):
+                            raise RuntimeError(
+                                f"row {row} fill nnz mismatch: expected {row_end - row_start}, got {row_cols.numel()}"
+                            )
+                        c_indices[row_start:row_end] = row_cols
+                        c_data[row_start:row_end] = row_vals
+                elif bucket_id == _SPGEMM_BUCKET_MEDIUM:
+                    for row in rows_iter:
+                        row_cols, row_vals = _spgemm_fill_row_hash(prepared, row)
+                        row_start = int(c_indptr[int(row)].item())
+                        row_end = int(c_indptr[int(row) + 1].item())
+                        if row_cols.numel() != (row_end - row_start):
+                            raise RuntimeError(
+                                f"row {row} fill nnz mismatch: expected {row_end - row_start}, got {row_cols.numel()}"
+                            )
+                        c_indices[row_start:row_end] = row_cols
+                        c_data[row_start:row_end] = row_vals
+                else:
+                    for row in rows_iter:
+                        row = int(row)
+                        slices = _iter_row_a_slices(
                             prepared,
                             row,
-                            a_start,
-                            a_end,
-                            need_values=True,
+                            max_expanded=prepared.long_row_slice_expanded,
                         )
-                        if keys.numel() == 0:
+                        if len(slices) > 1:
+                            long_row_sliced += 1
+                        slice_cols = []
+                        slice_vals = []
+                        for a_start, a_end in slices:
+                            uniq_cols, uniq_vals = _spgemm_fill_row_slice_hash(
+                                prepared,
+                                row,
+                                a_start,
+                                a_end,
+                            )
+                            if uniq_cols.numel() == 0:
+                                continue
+                            slice_cols.append(uniq_cols)
+                            slice_vals.append(uniq_vals)
+                        row_start = int(c_indptr[row].item())
+                        row_end = int(c_indptr[row + 1].item())
+                        row_nnz = row_end - row_start
+                        if row_nnz == 0:
                             continue
-                        uniq_k, uniq_v = _sort_reduce_pairs(
-                            keys,
-                            vals,
-                            out_dtype=prepared.a_data.dtype,
-                        )
-                        key_parts.append(uniq_k)
-                        val_parts.append(uniq_v)
-                    row_start = int(c_indptr[row].item())
-                    row_end = int(c_indptr[row + 1].item())
-                    row_nnz = row_end - row_start
-                    if row_nnz == 0:
-                        continue
-                    if not key_parts:
-                        raise RuntimeError(f"row {row} expected nnz={row_nnz} but got empty fill")
-                    row_keys = torch.cat(key_parts)
-                    row_vals = torch.cat(val_parts)
-                    row_keys, row_vals = _sort_reduce_pairs(
-                        row_keys,
-                        row_vals,
-                        out_dtype=prepared.a_data.dtype,
-                    )
-                    if row_keys.numel() != row_nnz:
-                        raise RuntimeError(
-                            f"row {row} fill nnz mismatch: expected {row_nnz}, got {row_keys.numel()}"
-                        )
-                    row_cols = (row_keys - row * max(1, prepared.n_cols)).to(torch.int32)
-                    c_indices[row_start:row_end] = row_cols
-                    c_data[row_start:row_end] = row_vals
+                        if not slice_cols:
+                            raise RuntimeError(f"row {row} expected nnz={row_nnz} but got empty fill")
+                        if len(slice_cols) == 1:
+                            row_cols = slice_cols[0]
+                            row_vals = slice_vals[0]
+                        else:
+                            merged_cols = torch.cat(slice_cols)
+                            merged_vals = torch.cat(slice_vals)
+                            row_cols, row_vals = _accumulate_known_cols(
+                                merged_cols,
+                                merged_vals,
+                                torch.unique(merged_cols.to(torch.int64), sorted=True).to(torch.int32),
+                                prepared.a_data.dtype,
+                            )
+                        if row_cols.numel() != row_nnz:
+                            raise RuntimeError(
+                                f"row {row} fill nnz mismatch: expected {row_nnz}, got {row_cols.numel()}"
+                            )
+                        c_indices[row_start:row_end] = row_cols
+                        c_data[row_start:row_end] = row_vals
+            except Exception:
+                bucket_route[bucket_id] = "legacy_sort"
+                long_row_sliced += _legacy_fill_rows_chunk(
+                    prepared,
+                    bucket_id,
+                    row_ids,
+                    c_indptr,
+                    c_data,
+                    c_indices,
+                )
             if profile:
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - t_bucket0) * 1000.0
@@ -885,6 +1332,14 @@ def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, prof
         "bucket_fill_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
         "bucket_fill_ms_long": bucket_ms[_SPGEMM_BUCKET_LONG],
         "long_row_sliced_count_fill": int(long_row_sliced),
+        "numeric_route": (
+            "hash"
+            if all(route == "hash" for route in bucket_route.values())
+            else "legacy_sort"
+        ),
+        "bucket_route_short": bucket_route[_SPGEMM_BUCKET_SHORT],
+        "bucket_route_medium": bucket_route[_SPGEMM_BUCKET_MEDIUM],
+        "bucket_route_long": bucket_route[_SPGEMM_BUCKET_LONG],
     }
     return c_data, c_indices, meta
 
@@ -945,6 +1400,7 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
     else:
         fill_ms = None
     _clear_fill_schedule(prepared)
+    _clear_short_symbolic_cache(prepared)
 
     def _sum_bucket_ms(count_key, fill_key):
         count_val = count_meta[count_key]
@@ -965,6 +1421,23 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
         "bucket_fill_ms_short": fill_meta["bucket_fill_ms_short"],
         "bucket_fill_ms_medium": fill_meta["bucket_fill_ms_medium"],
         "bucket_fill_ms_long": fill_meta["bucket_fill_ms_long"],
+        "symbolic_route": count_meta["symbolic_route"],
+        "numeric_route": fill_meta["numeric_route"],
+        "bucket_route_short": (
+            count_meta["bucket_route_short"]
+            if count_meta["bucket_route_short"] == fill_meta["bucket_route_short"]
+            else f"{count_meta['bucket_route_short']}->{fill_meta['bucket_route_short']}"
+        ),
+        "bucket_route_medium": (
+            count_meta["bucket_route_medium"]
+            if count_meta["bucket_route_medium"] == fill_meta["bucket_route_medium"]
+            else f"{count_meta['bucket_route_medium']}->{fill_meta['bucket_route_medium']}"
+        ),
+        "bucket_route_long": (
+            count_meta["bucket_route_long"]
+            if count_meta["bucket_route_long"] == fill_meta["bucket_route_long"]
+            else f"{count_meta['bucket_route_long']}->{fill_meta['bucket_route_long']}"
+        ),
         "bucket_nrows_short": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_SHORT).item()),
         "bucket_nrows_medium": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_MEDIUM).item()),
         "bucket_nrows_long": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG).item()),
@@ -993,7 +1466,6 @@ def flagsparse_spgemm_csr(
 ):
     """CSR SpGEMM: C = A @ B with CSR output (Triton-only main path)."""
     prepare_ms = 0.0
-    internal_prepared = prepared is None
     if prepared is None:
         if any(
             x is None
@@ -1044,8 +1516,7 @@ def flagsparse_spgemm_csr(
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    if internal_prepared:
-        _clear_runtime_schedules(prepared)
+    _clear_runtime_schedules(prepared)
 
     result = (c_data, c_indices, c_indptr, (prepared.n_rows, prepared.n_cols))
     if return_time and return_meta:
@@ -1055,6 +1526,11 @@ def flagsparse_spgemm_csr(
             "fill_ms": stage_meta["fill_ms"],
             "triton_ms": elapsed_ms,
             "hash_capacity_hint": prepared.hash_capacity_hint,
+            "symbolic_route": stage_meta["symbolic_route"],
+            "numeric_route": stage_meta["numeric_route"],
+            "bucket_route_short": stage_meta["bucket_route_short"],
+            "bucket_route_medium": stage_meta["bucket_route_medium"],
+            "bucket_route_long": stage_meta["bucket_route_long"],
             "bucket_ms_short": stage_meta["bucket_ms_short"],
             "bucket_ms_medium": stage_meta["bucket_ms_medium"],
             "bucket_ms_long": stage_meta["bucket_ms_long"],
@@ -1078,6 +1554,11 @@ def flagsparse_spgemm_csr(
             "count_ms": stage_meta["count_ms"],
             "fill_ms": stage_meta["fill_ms"],
             "hash_capacity_hint": prepared.hash_capacity_hint,
+            "symbolic_route": stage_meta["symbolic_route"],
+            "numeric_route": stage_meta["numeric_route"],
+            "bucket_route_short": stage_meta["bucket_route_short"],
+            "bucket_route_medium": stage_meta["bucket_route_medium"],
+            "bucket_route_long": stage_meta["bucket_route_long"],
             "bucket_ms_short": stage_meta["bucket_ms_short"],
             "bucket_ms_medium": stage_meta["bucket_ms_medium"],
             "bucket_ms_long": stage_meta["bucket_ms_long"],

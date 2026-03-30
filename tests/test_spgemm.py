@@ -901,6 +901,11 @@ def run_one_mtx(
         "bucket_ms_short": None,
         "bucket_ms_medium": None,
         "bucket_ms_long": None,
+        "symbolic_route": None,
+        "numeric_route": None,
+        "bucket_route_short": None,
+        "bucket_route_medium": None,
+        "bucket_route_long": None,
         "long_row_sliced_count": None,
         "effective_warmup": None,
         "effective_iters": None,
@@ -961,6 +966,11 @@ def run_one_mtx(
         result["bucket_ms_short"] = meta.get("bucket_ms_short")
         result["bucket_ms_medium"] = meta.get("bucket_ms_medium")
         result["bucket_ms_long"] = meta.get("bucket_ms_long")
+        result["symbolic_route"] = meta.get("symbolic_route")
+        result["numeric_route"] = meta.get("numeric_route")
+        result["bucket_route_short"] = meta.get("bucket_route_short")
+        result["bucket_route_medium"] = meta.get("bucket_route_medium")
+        result["bucket_route_long"] = meta.get("bucket_route_long")
         result["long_row_sliced_count"] = meta.get("long_row_sliced_count")
         result["effective_warmup"] = meta.get("effective_warmup")
         result["effective_iters"] = meta.get("effective_iters")
@@ -1271,6 +1281,19 @@ def _print_spgemm_mtx_row(entry):
             f"bucket_ms(s/m/l)={_fmt_ms(b_ms[0])}/{_fmt_ms(b_ms[1])}/{_fmt_ms(b_ms[2])} "
             f"long_row_sliced={entry.get('long_row_sliced_count') if entry.get('long_row_sliced_count') is not None else 'N/A'}"
         )
+    if (
+        entry.get("symbolic_route") is not None
+        or entry.get("numeric_route") is not None
+        or entry.get("bucket_route_short") is not None
+    ):
+        print(
+            "  ROUTE: "
+            f"symbolic={entry.get('symbolic_route') or 'N/A'} "
+            f"numeric={entry.get('numeric_route') or 'N/A'} "
+            f"bucket(s/m/l)={entry.get('bucket_route_short') or 'N/A'}/"
+            f"{entry.get('bucket_route_medium') or 'N/A'}/"
+            f"{entry.get('bucket_route_long') or 'N/A'}"
+        )
 
 
 def print_mtx_results(results, value_dtype, index_dtype):
@@ -1369,6 +1392,11 @@ def run_all_dtypes_export_csv(
                         "bucket_ms_short": entry.get("bucket_ms_short"),
                         "bucket_ms_medium": entry.get("bucket_ms_medium"),
                         "bucket_ms_long": entry.get("bucket_ms_long"),
+                        "symbolic_route": entry.get("symbolic_route"),
+                        "numeric_route": entry.get("numeric_route"),
+                        "bucket_route_short": entry.get("bucket_route_short"),
+                        "bucket_route_medium": entry.get("bucket_route_medium"),
+                        "bucket_route_long": entry.get("bucket_route_long"),
                         "long_row_sliced_count": entry.get("long_row_sliced_count"),
                         "triton_started": entry.get("triton_started"),
                         "ref_started": entry.get("ref_started"),
@@ -1390,6 +1418,8 @@ def run_all_dtypes_export_csv(
         "prepare_ms", "count_ms", "fill_ms",
         "bucket_nrows_short", "bucket_nrows_medium", "bucket_nrows_long",
         "bucket_ms_short", "bucket_ms_medium", "bucket_ms_long",
+        "symbolic_route", "numeric_route",
+        "bucket_route_short", "bucket_route_medium", "bucket_route_long",
         "long_row_sliced_count",
         "triton_started", "ref_started",
         "effective_warmup", "effective_iters",
