@@ -61,6 +61,7 @@ class SpGEMMPrepared:
         "count_chunks_by_bucket",
         "fill_chunks_by_bucket",
         "long_row_slice_expanded",
+        "long_row_slices_host",
         "hash_capacity_hint",
         "block_nnz",
     )
@@ -84,6 +85,7 @@ class SpGEMMPrepared:
         count_chunks_by_bucket,
         fill_chunks_by_bucket,
         long_row_slice_expanded,
+        long_row_slices_host,
         hash_capacity_hint,
         block_nnz,
     ):
@@ -107,6 +109,7 @@ class SpGEMMPrepared:
         self.count_chunks_by_bucket = count_chunks_by_bucket
         self.fill_chunks_by_bucket = fill_chunks_by_bucket
         self.long_row_slice_expanded = int(long_row_slice_expanded)
+        self.long_row_slices_host = long_row_slices_host
         self.hash_capacity_hint = int(hash_capacity_hint)
         self.block_nnz = int(block_nnz)
 
@@ -243,6 +246,41 @@ def _build_row_bucket(a_row_work):
     return bucket
 
 
+def _build_long_row_slices_host(a_indptr, a_indices, b_indptr, row_ids, max_expanded):
+    if row_ids is None or row_ids.numel() == 0:
+        return {}
+
+    out = {}
+    row_list = row_ids.to(torch.int64).cpu().tolist()
+    a_indptr_cpu = a_indptr.to(torch.int64).cpu()
+    for row in row_list:
+        start = int(a_indptr_cpu[row].item())
+        end = int(a_indptr_cpu[row + 1].item())
+        if end <= start:
+            out[int(row)] = []
+            continue
+        a_cols = a_indices[start:end].to(torch.int64)
+        b_counts = (b_indptr[a_cols + 1] - b_indptr[a_cols]).to(torch.int64)
+        counts_host = b_counts.cpu().tolist()
+        slices = []
+        idx = 0
+        total = len(counts_host)
+        while idx < total:
+            seg_start = idx
+            acc = 0
+            while idx < total:
+                w = int(counts_host[idx])
+                if idx > seg_start and acc + w > int(max_expanded):
+                    break
+                acc += w
+                idx += 1
+                if idx == seg_start + 1 and w > int(max_expanded):
+                    break
+            slices.append((start + seg_start, start + idx))
+        out[int(row)] = slices
+    return out
+
+
 def prepare_spgemm_csr(
     a_data,
     a_indices,
@@ -304,35 +342,23 @@ def prepare_spgemm_csr(
                 cols = a_indices[start:end].to(torch.int64)
                 row_work[row] = torch.sum(b_row_nnz[cols]).to(torch.int32)
         row_bucket = _build_row_bucket(row_work)
-        hash_capacity_hint = _estimate_hash_capacity(row_work)
+        hash_capacity_hint = 256
         row_work_ready = True
     else:
         row_work = torch.zeros(n_rows, dtype=torch.int32, device=a_data.device)
         row_bucket = torch.zeros(n_rows, dtype=torch.int8, device=a_data.device)
         hash_capacity_hint = 256
         row_work_ready = False
-    bucket_rows = _build_bucket_rows(row_bucket, a_data.device)
-    count_chunks_by_bucket = {}
-    fill_chunks_by_bucket = {}
-    count_chunks = None
-    fill_chunks = None
+    long_row_slices_host = {}
     if row_work_ready:
-        for bucket_id in _SPGEMM_BUCKET_ORDER:
-            rows = bucket_rows[bucket_id]
-            count_chunks_by_bucket[bucket_id] = _build_row_id_chunks(
-                row_work,
-                rows,
-                max_expanded=_SPGEMM_BUCKET_COUNT_BUDGETS[bucket_id],
-                max_rows_per_chunk=_SPGEMM_BUCKET_MAX_ROWS[bucket_id],
-            )
-            fill_chunks_by_bucket[bucket_id] = _build_row_id_chunks(
-                row_work,
-                rows,
-                max_expanded=_SPGEMM_BUCKET_FILL_BUDGETS[bucket_id],
-                max_rows_per_chunk=_SPGEMM_BUCKET_MAX_ROWS[bucket_id],
-            )
-        count_chunks = _compose_ordered_chunks(count_chunks_by_bucket)
-        fill_chunks = _compose_ordered_chunks(fill_chunks_by_bucket)
+        long_rows = torch.nonzero(row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten()
+        long_row_slices_host = _build_long_row_slices_host(
+            a_indptr,
+            a_indices,
+            b_indptr,
+            long_rows,
+            _SPGEMM_LONG_ROW_SLICE_EXPANDED,
+        )
     return SpGEMMPrepared(
         a_data=a_data,
         a_indices=a_indices,
@@ -345,12 +371,13 @@ def prepare_spgemm_csr(
         a_row_work=row_work,
         row_bucket=row_bucket,
         row_work_ready=row_work_ready,
-        bucket_rows=bucket_rows,
-        count_chunks=count_chunks,
-        fill_chunks=fill_chunks,
-        count_chunks_by_bucket=count_chunks_by_bucket if row_work_ready else None,
-        fill_chunks_by_bucket=fill_chunks_by_bucket if row_work_ready else None,
+        bucket_rows=None,
+        count_chunks=None,
+        fill_chunks=None,
+        count_chunks_by_bucket=None,
+        fill_chunks_by_bucket=None,
         long_row_slice_expanded=_SPGEMM_LONG_ROW_SLICE_EXPANDED,
+        long_row_slices_host=long_row_slices_host,
         hash_capacity_hint=hash_capacity_hint,
         block_nnz=block_nnz,
     )
@@ -364,7 +391,8 @@ def _ensure_row_work(prepared):
         prepared.row_bucket = torch.zeros(prepared.n_rows, dtype=torch.int8, device=prepared.a_data.device)
         prepared.hash_capacity_hint = 256
         prepared.row_work_ready = True
-        _refresh_row_chunks(prepared)
+        prepared.long_row_slices_host = {}
+        _clear_runtime_schedules(prepared)
         return
     row_work = torch.empty(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
     _spgemm_row_work_kernel[(prepared.n_rows,)](
@@ -377,9 +405,17 @@ def _ensure_row_work(prepared):
     )
     prepared.a_row_work = row_work
     prepared.row_bucket = _build_row_bucket(row_work)
-    prepared.hash_capacity_hint = _estimate_hash_capacity(row_work)
+    long_rows = torch.nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten()
+    prepared.long_row_slices_host = _build_long_row_slices_host(
+        prepared.a_indptr,
+        prepared.a_indices,
+        prepared.b_indptr,
+        long_rows,
+        prepared.long_row_slice_expanded,
+    )
+    prepared.hash_capacity_hint = 256
     prepared.row_work_ready = True
-    _refresh_row_chunks(prepared)
+    _clear_runtime_schedules(prepared)
 
 
 def _build_row_chunks(row_work, max_expanded, max_rows_per_chunk):
@@ -431,26 +467,69 @@ def _compose_ordered_chunks(chunks_by_bucket):
     return ordered
 
 
-def _refresh_row_chunks(prepared):
-    prepared.bucket_rows = _build_bucket_rows(prepared.row_bucket, prepared.a_data.device)
+def _clear_runtime_schedules(prepared):
+    prepared.bucket_rows = None
+    prepared.count_chunks = None
+    prepared.fill_chunks = None
+    prepared.count_chunks_by_bucket = None
+    prepared.fill_chunks_by_bucket = None
+
+
+def _clear_count_schedule(prepared):
+    prepared.count_chunks = None
+    prepared.count_chunks_by_bucket = None
+
+
+def _clear_fill_schedule(prepared):
+    prepared.fill_chunks = None
+    prepared.fill_chunks_by_bucket = None
+
+
+def _ensure_bucket_rows(prepared):
+    if prepared.bucket_rows is None:
+        prepared.bucket_rows = _build_bucket_rows(prepared.row_bucket, prepared.a_data.device)
+    return prepared.bucket_rows
+
+
+def _chunk_rows_for_bucket(prepared, bucket_id, max_expanded):
+    rows = _ensure_bucket_rows(prepared)[bucket_id]
+    chunks = _build_row_id_chunks(
+        prepared.a_row_work,
+        rows,
+        max_expanded=max_expanded,
+        max_rows_per_chunk=_SPGEMM_BUCKET_MAX_ROWS[bucket_id],
+    )
+    if bucket_id == _SPGEMM_BUCKET_LONG:
+        return [chunk.to(torch.int64).cpu().tolist() for chunk in chunks]
+    return chunks
+
+
+def _ensure_count_chunks(prepared):
+    if prepared.count_chunks_by_bucket is not None:
+        return prepared.count_chunks_by_bucket
     prepared.count_chunks_by_bucket = {}
-    prepared.fill_chunks_by_bucket = {}
     for bucket_id in _SPGEMM_BUCKET_ORDER:
-        rows = prepared.bucket_rows[bucket_id]
-        prepared.count_chunks_by_bucket[bucket_id] = _build_row_id_chunks(
-            prepared.a_row_work,
-            rows,
-            max_expanded=_SPGEMM_BUCKET_COUNT_BUDGETS[bucket_id],
-            max_rows_per_chunk=_SPGEMM_BUCKET_MAX_ROWS[bucket_id],
-        )
-        prepared.fill_chunks_by_bucket[bucket_id] = _build_row_id_chunks(
-            prepared.a_row_work,
-            rows,
-            max_expanded=_SPGEMM_BUCKET_FILL_BUDGETS[bucket_id],
-            max_rows_per_chunk=_SPGEMM_BUCKET_MAX_ROWS[bucket_id],
+        prepared.count_chunks_by_bucket[bucket_id] = _chunk_rows_for_bucket(
+            prepared,
+            bucket_id,
+            _SPGEMM_BUCKET_COUNT_BUDGETS[bucket_id],
         )
     prepared.count_chunks = _compose_ordered_chunks(prepared.count_chunks_by_bucket)
+    return prepared.count_chunks_by_bucket
+
+
+def _ensure_fill_chunks(prepared):
+    if prepared.fill_chunks_by_bucket is not None:
+        return prepared.fill_chunks_by_bucket
+    prepared.fill_chunks_by_bucket = {}
+    for bucket_id in _SPGEMM_BUCKET_ORDER:
+        prepared.fill_chunks_by_bucket[bucket_id] = _chunk_rows_for_bucket(
+            prepared,
+            bucket_id,
+            _SPGEMM_BUCKET_FILL_BUDGETS[bucket_id],
+        )
     prepared.fill_chunks = _compose_ordered_chunks(prepared.fill_chunks_by_bucket)
+    return prepared.fill_chunks_by_bucket
 
 
 def _expand_rows_contrib(prepared, row_ids, need_values):
@@ -564,13 +643,18 @@ def _expand_single_row_slice_contrib(prepared, row, a_ptr_start, a_ptr_end, need
 
 
 def _iter_row_a_slices(prepared, row, max_expanded):
+    cached = prepared.long_row_slices_host.get(int(row)) if prepared.long_row_slices_host is not None else None
+    if cached is not None:
+        return cached
     start = int(prepared.a_indptr[row].item())
     end = int(prepared.a_indptr[row + 1].item())
     if end <= start:
+        if prepared.long_row_slices_host is not None:
+            prepared.long_row_slices_host[int(row)] = []
         return []
     a_cols = prepared.a_indices[start:end].to(torch.int64)
     b_counts = (prepared.b_indptr[a_cols + 1] - prepared.b_indptr[a_cols]).to(torch.int64)
-    counts_host = b_counts.detach().to("cpu").tolist()
+    counts_host = b_counts.cpu().tolist()
     slices = []
     idx = 0
     total = len(counts_host)
@@ -586,6 +670,8 @@ def _iter_row_a_slices(prepared, row, max_expanded):
             if idx == seg_start + 1 and w > int(max_expanded):
                 break
         slices.append((start + seg_start, start + idx))
+    if prepared.long_row_slices_host is not None:
+        prepared.long_row_slices_host[int(row)] = slices
     return slices
 
 
@@ -616,19 +702,19 @@ def _sort_reduce_pairs(keys, vals, out_dtype):
     return _reduce_sorted_keys_vals(keys_sorted, vals_sorted, out_dtype)
 
 
-def _spgemm_count_phase(prepared):
+def _spgemm_count_phase(prepared, profile=False):
     n_rows = prepared.n_rows
     device = prepared.a_data.device
     row_nnz_c = torch.zeros(n_rows, dtype=torch.int64, device=device)
-    bucket_ms = {bucket_id: 0.0 for bucket_id in _SPGEMM_BUCKET_ORDER}
+    bucket_ms = {bucket_id: None for bucket_id in _SPGEMM_BUCKET_ORDER}
     long_row_sliced = 0
-    if prepared.count_chunks_by_bucket is None:
-        _refresh_row_chunks(prepared)
+    chunks_by_bucket = _ensure_count_chunks(prepared)
     for bucket_id in _SPGEMM_BUCKET_ORDER:
-        chunks = prepared.count_chunks_by_bucket.get(bucket_id, [])
+        chunks = chunks_by_bucket.get(bucket_id, [])
         for row_ids in chunks:
-            torch.cuda.synchronize()
-            t_bucket0 = time.perf_counter()
+            if profile:
+                torch.cuda.synchronize()
+                t_bucket0 = time.perf_counter()
             if bucket_id != _SPGEMM_BUCKET_LONG:
                 keys, _ = _expand_rows_contrib(prepared, row_ids, need_values=False)
                 if keys.numel() > 0:
@@ -643,7 +729,7 @@ def _spgemm_count_phase(prepared):
                     )
                     row_nnz_c[rows_unique] = counts.to(torch.int64)
             else:
-                for row in row_ids.detach().to("cpu", dtype=torch.int64).tolist():
+                for row in row_ids:
                     slices = _iter_row_a_slices(
                         prepared,
                         int(row),
@@ -668,8 +754,12 @@ def _spgemm_count_phase(prepared):
                         continue
                     uniq_row_keys = torch.unique(torch.cat(keys_parts), sorted=True)
                     row_nnz_c[int(row)] = int(uniq_row_keys.numel())
-            torch.cuda.synchronize()
-            bucket_ms[bucket_id] += (time.perf_counter() - t_bucket0) * 1000.0
+            if profile:
+                torch.cuda.synchronize()
+                elapsed = (time.perf_counter() - t_bucket0) * 1000.0
+                bucket_ms[bucket_id] = (
+                    elapsed if bucket_ms[bucket_id] is None else bucket_ms[bucket_id] + elapsed
+                )
     meta = {
         "bucket_count_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
         "bucket_count_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
@@ -679,12 +769,20 @@ def _spgemm_count_phase(prepared):
     return row_nnz_c, meta
 
 
-def _spgemm_fill_phase(prepared, c_indptr):
+def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, profile=False):
     nnz_c = int(c_indptr[-1].item())
     device = prepared.a_data.device
-    c_data = torch.empty(nnz_c, dtype=prepared.a_data.dtype, device=device)
-    c_indices = torch.empty(nnz_c, dtype=torch.int32, device=device)
-    bucket_ms = {bucket_id: 0.0 for bucket_id in _SPGEMM_BUCKET_ORDER}
+    c_data = (
+        out_data
+        if out_data is not None
+        else torch.empty(nnz_c, dtype=prepared.a_data.dtype, device=device)
+    )
+    c_indices = (
+        out_indices
+        if out_indices is not None
+        else torch.empty(nnz_c, dtype=torch.int32, device=device)
+    )
+    bucket_ms = {bucket_id: None for bucket_id in _SPGEMM_BUCKET_ORDER}
     long_row_sliced = 0
     if nnz_c == 0:
         meta = {
@@ -695,13 +793,13 @@ def _spgemm_fill_phase(prepared, c_indptr):
         }
         return c_data, c_indices, meta
 
-    if prepared.fill_chunks_by_bucket is None:
-        _refresh_row_chunks(prepared)
+    chunks_by_bucket = _ensure_fill_chunks(prepared)
     for bucket_id in _SPGEMM_BUCKET_ORDER:
-        chunks = prepared.fill_chunks_by_bucket.get(bucket_id, [])
+        chunks = chunks_by_bucket.get(bucket_id, [])
         for row_ids in chunks:
-            torch.cuda.synchronize()
-            t_bucket0 = time.perf_counter()
+            if profile:
+                torch.cuda.synchronize()
+                t_bucket0 = time.perf_counter()
             if bucket_id != _SPGEMM_BUCKET_LONG:
                 keys, vals = _expand_rows_contrib(prepared, row_ids, need_values=True)
                 if keys.numel() > 0:
@@ -726,7 +824,7 @@ def _spgemm_fill_phase(prepared, c_indptr):
                     c_indices[dst] = uniq_cols
                     c_data[dst] = uniq_vals
             else:
-                for row in row_ids.detach().to("cpu", dtype=torch.int64).tolist():
+                for row in row_ids:
                     row = int(row)
                     slices = _iter_row_a_slices(
                         prepared,
@@ -775,8 +873,12 @@ def _spgemm_fill_phase(prepared, c_indptr):
                     row_cols = (row_keys - row * max(1, prepared.n_cols)).to(torch.int32)
                     c_indices[row_start:row_end] = row_cols
                     c_data[row_start:row_end] = row_vals
-            torch.cuda.synchronize()
-            bucket_ms[bucket_id] += (time.perf_counter() - t_bucket0) * 1000.0
+            if profile:
+                torch.cuda.synchronize()
+                elapsed = (time.perf_counter() - t_bucket0) * 1000.0
+                bucket_ms[bucket_id] = (
+                    elapsed if bucket_ms[bucket_id] is None else bucket_ms[bucket_id] + elapsed
+                )
 
     meta = {
         "bucket_fill_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
@@ -787,43 +889,85 @@ def _spgemm_fill_phase(prepared, c_indptr):
     return c_data, c_indices, meta
 
 
-def _run_spgemm_prepared(prepared):
+def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False):
     _ensure_row_work(prepared)
-    torch.cuda.synchronize()
-    t_count0 = time.perf_counter()
-    row_nnz_c, count_meta = _spgemm_count_phase(prepared)
-    torch.cuda.synchronize()
-    count_ms = (time.perf_counter() - t_count0) * 1000.0
+    if out is not None:
+        if not isinstance(out, (tuple, list)) or len(out) != 3:
+            raise TypeError("out must be a tuple/list of (data, indices, indptr)")
+        out_data, out_indices, out_indptr = out
+        if not out_data.is_cuda or not out_indices.is_cuda or not out_indptr.is_cuda:
+            raise ValueError("out data/indices/indptr must be CUDA tensors")
+        if out_data.device != prepared.a_data.device or out_indices.device != prepared.a_data.device or out_indptr.device != prepared.a_data.device:
+            raise ValueError("out data/indices/indptr must be on the same CUDA device as computed C")
+        if out_indptr.shape != (prepared.n_rows + 1,) or out_indptr.dtype != torch.int64:
+            raise ValueError("out indptr shape/dtype must match computed C indptr")
+    else:
+        out_data = out_indices = out_indptr = None
 
-    c_indptr = torch.empty(prepared.n_rows + 1, dtype=torch.int64, device=prepared.a_data.device)
+    if measure_stage:
+        torch.cuda.synchronize()
+        t_count0 = time.perf_counter()
+    row_nnz_c, count_meta = _spgemm_count_phase(prepared, profile=profile)
+    if measure_stage:
+        torch.cuda.synchronize()
+        count_ms = (time.perf_counter() - t_count0) * 1000.0
+    else:
+        count_ms = None
+    _clear_count_schedule(prepared)
+
+    c_indptr = out_indptr
+    if c_indptr is None:
+        c_indptr = torch.empty(prepared.n_rows + 1, dtype=torch.int64, device=prepared.a_data.device)
     c_indptr[0] = 0
     if prepared.n_rows > 0:
         c_indptr[1:] = torch.cumsum(row_nnz_c, dim=0)
+    nnz_c = int(c_indptr[-1].item()) if c_indptr.numel() > 0 else 0
 
-    torch.cuda.synchronize()
-    t_fill0 = time.perf_counter()
-    c_data, c_indices, fill_meta = _spgemm_fill_phase(prepared, c_indptr)
-    torch.cuda.synchronize()
-    fill_ms = (time.perf_counter() - t_fill0) * 1000.0
+    if out_data is not None:
+        if out_data.shape != (nnz_c,) or out_data.dtype != prepared.a_data.dtype:
+            raise ValueError("out data shape/dtype must match computed C data")
+        if out_indices.shape != (nnz_c,) or out_indices.dtype != torch.int32:
+            raise ValueError("out indices shape/dtype must match computed C indices")
 
-    bucket_ms_short = float(count_meta["bucket_count_ms_short"] + fill_meta["bucket_fill_ms_short"])
-    bucket_ms_medium = float(count_meta["bucket_count_ms_medium"] + fill_meta["bucket_fill_ms_medium"])
-    bucket_ms_long = float(count_meta["bucket_count_ms_long"] + fill_meta["bucket_fill_ms_long"])
+    if measure_stage:
+        torch.cuda.synchronize()
+        t_fill0 = time.perf_counter()
+    c_data, c_indices, fill_meta = _spgemm_fill_phase(
+        prepared,
+        c_indptr,
+        out_data=out_data,
+        out_indices=out_indices,
+        profile=profile,
+    )
+    if measure_stage:
+        torch.cuda.synchronize()
+        fill_ms = (time.perf_counter() - t_fill0) * 1000.0
+    else:
+        fill_ms = None
+    _clear_fill_schedule(prepared)
+
+    def _sum_bucket_ms(count_key, fill_key):
+        count_val = count_meta[count_key]
+        fill_val = fill_meta[fill_key]
+        if count_val is None or fill_val is None:
+            return None
+        return float(count_val + fill_val)
+
     return c_data, c_indices, c_indptr, {
         "count_ms": count_ms,
         "fill_ms": fill_ms,
-        "bucket_ms_short": bucket_ms_short,
-        "bucket_ms_medium": bucket_ms_medium,
-        "bucket_ms_long": bucket_ms_long,
+        "bucket_ms_short": _sum_bucket_ms("bucket_count_ms_short", "bucket_fill_ms_short"),
+        "bucket_ms_medium": _sum_bucket_ms("bucket_count_ms_medium", "bucket_fill_ms_medium"),
+        "bucket_ms_long": _sum_bucket_ms("bucket_count_ms_long", "bucket_fill_ms_long"),
         "bucket_count_ms_short": count_meta["bucket_count_ms_short"],
         "bucket_count_ms_medium": count_meta["bucket_count_ms_medium"],
         "bucket_count_ms_long": count_meta["bucket_count_ms_long"],
         "bucket_fill_ms_short": fill_meta["bucket_fill_ms_short"],
         "bucket_fill_ms_medium": fill_meta["bucket_fill_ms_medium"],
         "bucket_fill_ms_long": fill_meta["bucket_fill_ms_long"],
-        "bucket_nrows_short": int(prepared.bucket_rows[_SPGEMM_BUCKET_SHORT].numel()),
-        "bucket_nrows_medium": int(prepared.bucket_rows[_SPGEMM_BUCKET_MEDIUM].numel()),
-        "bucket_nrows_long": int(prepared.bucket_rows[_SPGEMM_BUCKET_LONG].numel()),
+        "bucket_nrows_short": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_SHORT).item()),
+        "bucket_nrows_medium": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_MEDIUM).item()),
+        "bucket_nrows_long": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG).item()),
         "long_row_sliced_count": int(
             max(
                 count_meta["long_row_sliced_count_count"],
@@ -849,6 +993,7 @@ def flagsparse_spgemm_csr(
 ):
     """CSR SpGEMM: C = A @ B with CSR output (Triton-only main path)."""
     prepare_ms = 0.0
+    internal_prepared = prepared is None
     if prepared is None:
         if any(
             x is None
@@ -866,8 +1011,9 @@ def flagsparse_spgemm_csr(
             raise ValueError(
                 "A/B CSR tensors and shapes are required when prepared is not provided"
             )
-        torch.cuda.synchronize()
-        t_prepare0 = time.perf_counter()
+        if return_meta:
+            torch.cuda.synchronize()
+            t_prepare0 = time.perf_counter()
         prepared = prepare_spgemm_csr(
             a_data,
             a_indices,
@@ -878,39 +1024,28 @@ def flagsparse_spgemm_csr(
             b_indptr,
             b_shape,
         )
-        torch.cuda.synchronize()
-        prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
+        if return_meta:
+            torch.cuda.synchronize()
+            prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
     elif not isinstance(prepared, SpGEMMPrepared):
         raise TypeError("prepared must be a SpGEMMPrepared instance")
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    c_data, c_indices, c_indptr, stage_meta = _run_spgemm_prepared(prepared)
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    elapsed_ms = None
+    if return_time:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    c_data, c_indices, c_indptr, stage_meta = _run_spgemm_prepared(
+        prepared,
+        out=out,
+        profile=bool(return_meta),
+        measure_stage=bool(return_meta),
+    )
+    if return_time:
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    if out is not None:
-        if not isinstance(out, (tuple, list)) or len(out) != 3:
-            raise TypeError("out must be a tuple/list of (data, indices, indptr)")
-        out_data, out_indices, out_indptr = out
-        if not out_data.is_cuda or not out_indices.is_cuda or not out_indptr.is_cuda:
-            raise ValueError("out data/indices/indptr must be CUDA tensors")
-        if (
-            out_data.device != c_data.device
-            or out_indices.device != c_indices.device
-            or out_indptr.device != c_indptr.device
-        ):
-            raise ValueError("out data/indices/indptr must be on the same CUDA device as computed C")
-        if out_data.shape != c_data.shape or out_data.dtype != c_data.dtype:
-            raise ValueError("out data shape/dtype must match computed C data")
-        if out_indices.shape != c_indices.shape or out_indices.dtype != c_indices.dtype:
-            raise ValueError("out indices shape/dtype must match computed C indices")
-        if out_indptr.shape != c_indptr.shape or out_indptr.dtype != c_indptr.dtype:
-            raise ValueError("out indptr shape/dtype must match computed C indptr")
-        out_data.copy_(c_data)
-        out_indices.copy_(c_indices)
-        out_indptr.copy_(c_indptr)
-        c_data, c_indices, c_indptr = out_data, out_indices, out_indptr
+    if internal_prepared:
+        _clear_runtime_schedules(prepared)
 
     result = (c_data, c_indices, c_indptr, (prepared.n_rows, prepared.n_cols))
     if return_time and return_meta:

@@ -38,6 +38,7 @@ DEFAULT_INPUT_MODE = "auto"
 TARGET_TIMED_WINDOW_SECONDS = 8.0
 DEFAULT_REF_BLOCK_ROWS = 0  # auto
 DEFAULT_COMPARE_BLOCK_ROWS = 2048
+DEFAULT_COMPARE_DEVICE = "cpu"
 
 
 def _dtype_name(dtype):
@@ -296,6 +297,10 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
         "max_relative_error": max_rel,
         "reason": "ok" if ok else "value mismatch",
     }
+
+
+def _compare_spgemm_cpu(candidate, reference, value_dtype):
+    return _spgemm_compare_metrics(candidate, reference, value_dtype)
 
 
 def _classify_reference_reason(*messages):
@@ -617,6 +622,7 @@ def _run_reference_with_retries(
     mtx_path,
     value_dtype,
     input_mode,
+    result_device="gpu",
 ):
     run_direct = _build_torch_spgemm_reference if backend == "torch" else _build_cupy_spgemm_reference
     run_blocked = _build_torch_spgemm_reference_blocked if backend == "torch" else _build_cupy_spgemm_reference_blocked
@@ -654,10 +660,14 @@ def _run_reference_with_retries(
             b_shape,
         )
         _, ref_ms = ast_ops._benchmark_cuda_op(ref_op, warmup=warmup, iters=iters)
+        compare_result = _convert_result_for_compare(ref_result, result_device, a_data.device)
+        ref_result = None
+        if result_device == "cpu" and ref_cleanup:
+            _cleanup_reference_pools()
         state.update(
             {
                 "success": True,
-                "result": ref_result,
+                "result": compare_result,
                 "format": ref_format,
                 "ms": ref_ms,
                 "exec_mode": "direct",
@@ -688,10 +698,14 @@ def _run_reference_with_retries(
                     block_rows=int(br),
                 )
                 _, ref_ms = ast_ops._benchmark_cuda_op(ref_op, warmup=warmup, iters=iters)
+                compare_result = _convert_result_for_compare(ref_result, result_device, a_data.device)
+                ref_result = None
+                if result_device == "cpu" and ref_cleanup:
+                    _cleanup_reference_pools()
                 state.update(
                     {
                         "success": True,
-                        "result": ref_result,
+                        "result": compare_result,
                         "format": ref_format,
                         "ms": ref_ms,
                         "exec_mode": "blocked",
@@ -732,11 +746,15 @@ def _run_reference_with_retries(
             state.update(
                 {
                     "success": True,
-                    "result": (
-                        ref_payload[0].to(a_data.device),
-                        ref_payload[1].to(a_data.device),
-                        ref_payload[2].to(a_data.device),
-                        tuple(ref_payload[3]),
+                    "result": _convert_result_for_compare(
+                        (
+                            ref_payload[0],
+                            ref_payload[1],
+                            ref_payload[2],
+                            tuple(ref_payload[3]),
+                        ),
+                        result_device,
+                        a_data.device,
                     ),
                     "format": iso.get("format", "CSR"),
                     "ms": iso.get("ms"),
@@ -835,6 +853,7 @@ def run_one_mtx(
     ref_block_rows=DEFAULT_REF_BLOCK_ROWS,
     ref_isolated_retry=True,
     ref_cleanup=True,
+    compare_device=DEFAULT_COMPARE_DEVICE,
 ):
     case_start = time.perf_counter()
     device = torch.device("cuda")
@@ -903,6 +922,7 @@ def run_one_mtx(
         "attempted_modes_pt": None,
         "attempted_modes_cu": None,
         "compare_status": "OK",
+        "compare_device": compare_device,
         "pt_retry_count": 0,
         "cu_retry_count": 0,
         "ref_peak_block_rows": None,
@@ -911,6 +931,7 @@ def run_one_mtx(
     }
 
     triton_result = None
+    triton_compare_result = None
     try:
         result["triton_started"] = True
         triton_result, triton_ms, triton_first_ms, meta = _benchmark_flagsparse_spgemm(
@@ -944,6 +965,15 @@ def run_one_mtx(
         result["effective_warmup"] = meta.get("effective_warmup")
         result["effective_iters"] = meta.get("effective_iters")
         result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
+        triton_compare_result = _convert_result_for_compare(
+            triton_result,
+            compare_device,
+            device=device,
+        )
+        if compare_device == "cpu":
+            triton_result = None
+            if ref_cleanup:
+                _cleanup_reference_pools()
     except Exception as exc:
         result["error"] = _append_error(result["error"], f"triton: {exc}")
 
@@ -981,6 +1011,7 @@ def run_one_mtx(
         mtx_path=mtx_path,
         value_dtype=value_dtype,
         input_mode=input_mode,
+        result_device=compare_device,
     )
     result["pt_exec_mode"] = pt_ref.get("exec_mode")
     result["attempted_modes_pt"] = pt_ref.get("attempted_modes")
@@ -1019,6 +1050,7 @@ def run_one_mtx(
             mtx_path=mtx_path,
             value_dtype=value_dtype,
             input_mode=input_mode,
+            result_device=compare_device,
         )
         result["cu_exec_mode"] = cu_ref.get("exec_mode")
         result["attempted_modes_cu"] = cu_ref.get("attempted_modes")
@@ -1043,9 +1075,10 @@ def run_one_mtx(
         _cleanup_reference_pools()
 
     _log_stage(mtx_path, "compare", case_start)
-    if triton_result is not None and pt_ref_result is not None:
+    if triton_compare_result is not None and pt_ref_result is not None:
         try:
-            pt_metrics = _spgemm_compare_metrics(triton_result, pt_ref_result, value_dtype)
+            compare_fn = _compare_spgemm_cpu if compare_device == "cpu" else _spgemm_compare_metrics
+            pt_metrics = compare_fn(triton_compare_result, pt_ref_result, value_dtype)
             result["triton_ok_pt"] = pt_metrics["pass"]
             result["err_pt"] = pt_metrics["err_ratio"]
             result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
@@ -1060,9 +1093,15 @@ def run_one_mtx(
                 result["compare_status"] = "COMPARE_OOM"
             elif result.get("compare_status") == "OK":
                 result["compare_status"] = "COMPARE_FAIL"
-    if triton_result is not None and cu_ref_result is not None:
+        finally:
+            if compare_device == "cpu":
+                pt_ref_result = None
+                if ref_cleanup:
+                    _cleanup_reference_pools()
+    if triton_compare_result is not None and cu_ref_result is not None:
         try:
-            cu_metrics = _spgemm_compare_metrics(triton_result, cu_ref_result, value_dtype)
+            compare_fn = _compare_spgemm_cpu if compare_device == "cpu" else _spgemm_compare_metrics
+            cu_metrics = compare_fn(triton_compare_result, cu_ref_result, value_dtype)
             result["triton_ok_cu"] = cu_metrics["pass"]
             result["err_cu"] = cu_metrics["err_ratio"]
             result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
@@ -1077,8 +1116,13 @@ def run_one_mtx(
                 result["compare_status"] = "COMPARE_OOM"
             elif result.get("compare_status") == "OK":
                 result["compare_status"] = "COMPARE_FAIL"
+        finally:
+            if compare_device == "cpu":
+                cu_ref_result = None
+                if ref_cleanup:
+                    _cleanup_reference_pools()
 
-    if triton_result is None:
+    if triton_compare_result is None:
         result["status"] = "FAIL"
         result["ref_reason_code"] = _classify_reference_reason(
             result.get("pytorch_reason"),
@@ -1122,6 +1166,7 @@ def run_mtx_batch(
     ref_block_rows=DEFAULT_REF_BLOCK_ROWS,
     ref_isolated_retry=True,
     ref_cleanup=True,
+    compare_device=DEFAULT_COMPARE_DEVICE,
     on_result=None,
 ):
     results = []
@@ -1142,6 +1187,7 @@ def run_mtx_batch(
             ref_block_rows=ref_block_rows,
             ref_isolated_retry=ref_isolated_retry,
             ref_cleanup=ref_cleanup,
+            compare_device=compare_device,
         )
         results.append(entry)
         if on_result is not None:
@@ -1247,6 +1293,7 @@ def run_all_dtypes_export_csv(
     ref_block_rows=DEFAULT_REF_BLOCK_ROWS,
     ref_isolated_retry=True,
     ref_cleanup=True,
+    compare_device=DEFAULT_COMPARE_DEVICE,
 ):
     csv_path = _normalize_csv_path(csv_path)
     rows = []
@@ -1268,6 +1315,7 @@ def run_all_dtypes_export_csv(
                 ref_block_rows=ref_block_rows,
                 ref_isolated_retry=ref_isolated_retry,
                 ref_cleanup=ref_cleanup,
+                compare_device=compare_device,
                 on_result=_print_spgemm_mtx_row,
             )
             print("-" * 320)
@@ -1326,6 +1374,7 @@ def run_all_dtypes_export_csv(
                         "ref_started": entry.get("ref_started"),
                         "effective_warmup": entry.get("effective_warmup"),
                         "effective_iters": entry.get("effective_iters"),
+                        "compare_device": entry.get("compare_device"),
                     }
                 )
     fieldnames = [
@@ -1344,6 +1393,7 @@ def run_all_dtypes_export_csv(
         "long_row_sliced_count",
         "triton_started", "ref_started",
         "effective_warmup", "effective_iters",
+        "compare_device",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -1460,6 +1510,32 @@ def _csr_to_cpu_payload(csr_tuple):
         indptr.detach().to("cpu"),
         (int(shape[0]), int(shape[1])),
     )
+
+
+def _csr_to_device_payload(csr_tuple, device):
+    data, indices, indptr, shape = csr_tuple
+    return (
+        data.to(device),
+        indices.to(device),
+        indptr.to(device),
+        (int(shape[0]), int(shape[1])),
+    )
+
+
+def _convert_result_for_compare(csr_tuple, compare_device, device=None):
+    if csr_tuple is None:
+        return None
+    if compare_device == "cpu":
+        if csr_tuple[0].device.type == "cpu":
+            return csr_tuple
+        return _csr_to_cpu_payload(csr_tuple)
+    if compare_device == "gpu":
+        if csr_tuple[0].device.type == "cuda":
+            return csr_tuple
+        if device is None:
+            raise ValueError("device is required when converting CPU CSR payload back to CUDA")
+        return _csr_to_device_payload(csr_tuple, device)
+    raise ValueError(f"unsupported compare_device: {compare_device}")
 
 
 def _run_reference_worker(args):
@@ -1599,6 +1675,13 @@ def main():
         choices=["auto", "a_equals_b", "a_at"],
         help="extra option: auto(square->A@A, rectangular->A@A^T) to avoid shape mismatch on non-square matrices",
     )
+    parser.add_argument(
+        "--compare-device",
+        type=str,
+        default=DEFAULT_COMPARE_DEVICE,
+        choices=["cpu", "gpu"],
+        help="where to compare Triton/reference results; cpu mode offloads each result before compare",
+    )
     parser.add_argument("--_ref-worker", type=str, choices=["torch", "cupy"], default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_worker-mtx", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_worker-output", type=str, default=None, help=argparse.SUPPRESS)
@@ -1645,7 +1728,7 @@ def main():
             f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  "
             f"input_mode: {args.input_mode}  |  adaptive_loops: {args.adaptive_loops}  |  "
             f"ref_blocked_retry: {args.ref_blocked_retry}  |  ref_isolated_retry: {args.ref_isolated_retry}  |  "
-            f"ref_block_rows: {args.ref_block_rows}  |  CSV: {csv_path}"
+            f"ref_block_rows: {args.ref_block_rows}  |  compare_device: {args.compare_device}  |  CSV: {csv_path}"
         )
         run_all_dtypes_export_csv(
             paths,
@@ -1660,6 +1743,7 @@ def main():
             ref_block_rows=ref_block_rows,
             ref_isolated_retry=args.ref_isolated_retry,
             ref_cleanup=args.ref_cleanup,
+            compare_device=args.compare_device,
         )
         return
 
@@ -1671,7 +1755,7 @@ def main():
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  warmup: {args.warmup}  "
         f"iters: {args.iters}  adaptive_loops: {args.adaptive_loops}  input_mode: {args.input_mode}  "
         f"ref_blocked_retry: {args.ref_blocked_retry}  ref_isolated_retry: {args.ref_isolated_retry}  "
-        f"ref_block_rows: {args.ref_block_rows}"
+        f"ref_block_rows: {args.ref_block_rows}  compare_device: {args.compare_device}"
     )
     print()
     results = run_mtx_batch(
@@ -1688,6 +1772,7 @@ def main():
         ref_block_rows=ref_block_rows,
         ref_isolated_retry=args.ref_isolated_retry,
         ref_cleanup=args.ref_cleanup,
+        compare_device=args.compare_device,
     )
     print_mtx_results(results, value_dtype, index_dtype)
 
