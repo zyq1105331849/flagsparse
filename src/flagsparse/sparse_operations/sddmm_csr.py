@@ -3,7 +3,7 @@
 from ._common import *
 
 SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
-SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS = ("baseline", "acc64", "altreduce")
+SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS = ("baseline", "acc64", "acc64_out64", "altreduce")
 
 
 class SDDMMPrepared:
@@ -226,16 +226,17 @@ def _validate_sddmm_dense_inputs(data, prepared, x, y):
     return int(x.shape[1])
 
 
-def _prepare_validated_sddmm_out(prepared, x, out):
+def _prepare_validated_sddmm_out(prepared, x, out, out_dtype=None):
     nnz = prepared.nnz
+    target_dtype = x.dtype if out_dtype is None else out_dtype
     if out is None:
-        return torch.empty(nnz, dtype=x.dtype, device=x.device)
+        return torch.empty(nnz, dtype=target_dtype, device=x.device)
     if out.ndim != 1 or out.numel() != nnz:
         raise ValueError("out must be a 1D tensor with length nnz")
     if not out.is_cuda or out.device != x.device:
         raise ValueError("out must be a CUDA tensor on the same device as x")
-    if out.dtype != x.dtype:
-        raise TypeError("out dtype must match x/y dtype")
+    if out.dtype != target_dtype:
+        raise TypeError("out dtype must match the requested output dtype")
     return out
 
 
@@ -254,28 +255,38 @@ def _resolve_sddmm_diagnostic_kernel(variant, value_dtype):
     if variant == "baseline":
         acc_dtype = tl.float64 if value_dtype == torch.float64 else tl.float32
         return _sddmm_csr_real_kernel, acc_dtype
-    if variant == "acc64":
+    if variant in ("acc64", "acc64_out64"):
         return _sddmm_csr_real_kernel, tl.float64
     acc_dtype = tl.float64 if value_dtype == torch.float64 else tl.float32
     return _sddmm_csr_real_kernel_altreduce, acc_dtype
 
 
-def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=False, variant="baseline"):
+def _resolve_sddmm_diagnostic_out_dtype(variant, value_dtype):
+    variant = _normalize_sddmm_diagnostic_variant(variant)
+    if variant == "acc64_out64":
+        return torch.float64
+    return value_dtype
+
+
+def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=False, variant="baseline", out_dtype=None):
     nnz = prepared.nnz
-    out = _prepare_validated_sddmm_out(prepared, x, out)
+    variant = _normalize_sddmm_diagnostic_variant(variant)
+    target_out_dtype = _resolve_sddmm_diagnostic_out_dtype(variant, x.dtype) if out_dtype is None else out_dtype
+    out = _prepare_validated_sddmm_out(prepared, x, out, out_dtype=target_out_dtype)
     if nnz == 0:
         return out, {
             "block_k": prepared.block_k,
             "num_warps": prepared.num_warps,
             "fallback_used": False,
-            "variant": _normalize_sddmm_diagnostic_variant(variant),
+            "variant": variant,
+            "acc_dtype": "float64" if target_out_dtype == torch.float64 else "float32",
+            "out_dtype": str(target_out_dtype).replace("torch.", ""),
         }
 
     k_dim = int(x.shape[1])
     block_k, num_warps = _resolve_sddmm_launch_config(k_dim)
     block_p = 128
     kernel, acc_dtype = _resolve_sddmm_diagnostic_kernel(variant, x.dtype)
-    variant = _normalize_sddmm_diagnostic_variant(variant)
     grid = (triton.cdiv(nnz, block_p),)
     fallback_used = False
     if allow_fallback:
@@ -302,7 +313,7 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=F
                 num_warps=num_warps,
             )
         except Exception:
-            out.copy_(_sddmm_reference(prepared.indices, prepared.indptr, x, y, data, alpha, beta))
+            out.copy_(_sddmm_reference(prepared.indices, prepared.indptr, x, y, data, alpha, beta).to(out.dtype))
             fallback_used = True
     else:
         kernel[grid](
@@ -332,6 +343,7 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=F
         "fallback_used": fallback_used,
         "variant": variant,
         "acc_dtype": "float64" if acc_dtype == tl.float64 else "float32",
+        "out_dtype": str(out.dtype).replace("torch.", ""),
     }
 
 

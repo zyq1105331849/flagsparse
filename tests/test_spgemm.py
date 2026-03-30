@@ -951,11 +951,12 @@ def run_one_mtx(
         _cleanup_reference_pools()
     _log_stage(mtx_path, "reference", case_start)
     result["ref_started"] = True
-    ref_result = None
     pt_compared = False
     cu_compared = False
     pt_ref_success = False
     cu_ref_success = False
+    pt_ref_result = None
+    cu_ref_result = None
     ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
     ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
     ref_warmup = max(0, int(ref_warmup))
@@ -988,30 +989,15 @@ def run_one_mtx(
         result["ref_peak_block_rows"] = int(pt_ref["peak_block_rows"])
     if pt_ref.get("success"):
         pt_ref_success = True
-        ref_result = pt_ref.get("result")
+        pt_ref_result = pt_ref.get("result")
         result["pytorch_format"] = pt_ref.get("format")
         result["pytorch_ms"] = pt_ref.get("ms")
-        if triton_result is not None and ref_result is not None:
-            try:
-                pt_metrics = _spgemm_compare_metrics(triton_result, ref_result, value_dtype)
-                result["triton_ok_pt"] = pt_metrics["pass"]
-                result["err_pt"] = pt_metrics["err_ratio"]
-                result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
-                result["max_rel_err_pt"] = pt_metrics["max_relative_error"]
-                if not pt_metrics["pattern_ok"]:
-                    result["error"] = _append_error(result["error"], f"pt_ref: {pt_metrics['reason']}")
-                pt_compared = True
-            except Exception as cmp_exc:
-                cmp_msg = str(cmp_exc)
-                result["error"] = _append_error(result["error"], f"pt_compare: {cmp_msg}")
-                if _is_resource_error(cmp_msg):
-                    result["compare_status"] = "COMPARE_OOM"
-                elif result.get("compare_status") == "OK":
-                    result["compare_status"] = "COMPARE_FAIL"
     else:
         result["pytorch_reason"] = pt_ref.get("reason")
         result["ref_fail_stage"] = pt_ref.get("fail_stage")
         result["error"] = _append_error(result["error"], f"pt_ref: {pt_ref.get('reason')}")
+    if ref_cleanup:
+        _cleanup_reference_pools()
 
     if run_cusparse:
         cu_ref = _run_reference_with_retries(
@@ -1043,24 +1029,7 @@ def run_one_mtx(
         if cu_ref.get("success"):
             cu_ref_success = True
             result["cusparse_ms"] = cu_ref.get("ms")
-            c_ref = cu_ref.get("result")
-            if triton_result is not None and c_ref is not None:
-                try:
-                    cu_metrics = _spgemm_compare_metrics(triton_result, c_ref, value_dtype)
-                    result["triton_ok_cu"] = cu_metrics["pass"]
-                    result["err_cu"] = cu_metrics["err_ratio"]
-                    result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
-                    result["max_rel_err_cu"] = cu_metrics["max_relative_error"]
-                    if not cu_metrics["pattern_ok"]:
-                        result["error"] = _append_error(result["error"], f"cu_ref: {cu_metrics['reason']}")
-                    cu_compared = True
-                except Exception as cmp_exc:
-                    cmp_msg = str(cmp_exc)
-                    result["error"] = _append_error(result["error"], f"cu_compare: {cmp_msg}")
-                    if _is_resource_error(cmp_msg):
-                        result["compare_status"] = "COMPARE_OOM"
-                    elif result.get("compare_status") == "OK":
-                        result["compare_status"] = "COMPARE_FAIL"
+            cu_ref_result = cu_ref.get("result")
         else:
             result["cusparse_reason"] = cu_ref.get("reason")
             if result.get("ref_fail_stage") is None:
@@ -1070,8 +1039,45 @@ def run_one_mtx(
         result["cusparse_reason"] = "CuPy/cuSPARSE reference is disabled"
         result["cu_exec_mode"] = "disabled"
         result["attempted_modes_cu"] = "disabled"
+    if ref_cleanup:
+        _cleanup_reference_pools()
 
     _log_stage(mtx_path, "compare", case_start)
+    if triton_result is not None and pt_ref_result is not None:
+        try:
+            pt_metrics = _spgemm_compare_metrics(triton_result, pt_ref_result, value_dtype)
+            result["triton_ok_pt"] = pt_metrics["pass"]
+            result["err_pt"] = pt_metrics["err_ratio"]
+            result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
+            result["max_rel_err_pt"] = pt_metrics["max_relative_error"]
+            if not pt_metrics["pattern_ok"]:
+                result["error"] = _append_error(result["error"], f"pt_ref: {pt_metrics['reason']}")
+            pt_compared = True
+        except Exception as cmp_exc:
+            cmp_msg = str(cmp_exc)
+            result["error"] = _append_error(result["error"], f"pt_compare: {cmp_msg}")
+            if _is_resource_error(cmp_msg):
+                result["compare_status"] = "COMPARE_OOM"
+            elif result.get("compare_status") == "OK":
+                result["compare_status"] = "COMPARE_FAIL"
+    if triton_result is not None and cu_ref_result is not None:
+        try:
+            cu_metrics = _spgemm_compare_metrics(triton_result, cu_ref_result, value_dtype)
+            result["triton_ok_cu"] = cu_metrics["pass"]
+            result["err_cu"] = cu_metrics["err_ratio"]
+            result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
+            result["max_rel_err_cu"] = cu_metrics["max_relative_error"]
+            if not cu_metrics["pattern_ok"]:
+                result["error"] = _append_error(result["error"], f"cu_ref: {cu_metrics['reason']}")
+            cu_compared = True
+        except Exception as cmp_exc:
+            cmp_msg = str(cmp_exc)
+            result["error"] = _append_error(result["error"], f"cu_compare: {cmp_msg}")
+            if _is_resource_error(cmp_msg):
+                result["compare_status"] = "COMPARE_OOM"
+            elif result.get("compare_status") == "OK":
+                result["compare_status"] = "COMPARE_FAIL"
+
     if triton_result is None:
         result["status"] = "FAIL"
         result["ref_reason_code"] = _classify_reference_reason(

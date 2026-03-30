@@ -1,13 +1,9 @@
 ﻿"""
 SDDMM float32 diagnostic runner.
 
-This script isolates three Triton kernel variants for CSR SDDMM:
-1. baseline   : current float32 accumulate path
-2. acc64      : float32 input/output with float64 accumulation
-3. altreduce  : float32 accumulate with explicit step-by-step reduction
-
-It is intentionally separate from the general benchmark script so that the
-generated CSV stays diagnostic-only and does not mix with normal benchmark data.
+This script is intentionally separate from the general benchmark script. It is
+used to diagnose float32 SDDMM behavior with several Triton kernel variants and
+with an explicit float64 oracle path.
 """
 
 import argparse
@@ -39,12 +35,11 @@ from test_sddmm import (
     _fmt_ms,
     _is_resource_error,
     _normalize_csv_path,
-    _scaled_allclose_error,
     run_api_validation_checks,
 )
 from test_spmm import load_mtx_to_csr_torch
 
-DEFAULT_VARIANTS = ("baseline", "acc64", "altreduce")
+DEFAULT_VARIANTS = ("baseline", "acc64", "acc64_out64", "altreduce")
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
 DEFAULT_K = 64
@@ -75,8 +70,7 @@ def _make_cuda_generator(device, seed):
     return generator
 
 
-def _build_case_inputs(mtx_path, k_dim, alpha, beta, seed=None):
-    del alpha, beta
+def _build_case_inputs(mtx_path, k_dim, seed=None):
     device = torch.device("cuda")
     _pattern_values, indices, indptr, shape = load_mtx_to_csr_torch(
         mtx_path,
@@ -111,7 +105,63 @@ def _prepare_pattern(indices, indptr, shape, k_dim):
     return prepared, prepare_ms
 
 
-def _benchmark_triton_variant(prepared, data, x, y, alpha, beta, warmup, iters, variant):
+def _empty_metrics():
+    return {
+        "ok": None,
+        "scaled_max": None,
+        "max_abs": None,
+        "mean_abs": None,
+        "p99_scaled": None,
+        "mismatch_rate": None,
+    }
+
+
+def _quantile99(values):
+    if values.numel() == 0:
+        return 0.0
+    if values.numel() == 1:
+        return float(values.item())
+    return float(torch.quantile(values, 0.99).item())
+
+
+def _compute_metrics(candidate, reference, tolerance_dtype, compare_dtype=None):
+    metrics = _empty_metrics()
+    if reference is None:
+        return metrics
+    if compare_dtype is None:
+        compare_dtype = reference.dtype
+    cand = candidate.to(compare_dtype)
+    ref = reference.to(compare_dtype)
+    if cand.numel() == 0:
+        metrics.update(
+            {
+                "ok": True,
+                "scaled_max": 0.0,
+                "max_abs": 0.0,
+                "mean_abs": 0.0,
+                "p99_scaled": 0.0,
+                "mismatch_rate": 0.0,
+            }
+        )
+        return metrics
+    atol, rtol = ast_ops._tolerance_for_dtype(tolerance_dtype)
+    diff = torch.abs(cand - ref)
+    denom = atol + rtol * torch.abs(ref)
+    scaled = diff / denom
+    metrics.update(
+        {
+            "ok": bool(torch.allclose(cand, ref, atol=atol, rtol=rtol)),
+            "scaled_max": float(torch.max(scaled).item()),
+            "max_abs": float(torch.max(diff).item()),
+            "mean_abs": float(torch.mean(diff).item()),
+            "p99_scaled": _quantile99(scaled),
+            "mismatch_rate": float(torch.mean((scaled > 1.0).to(torch.float32)).item()),
+        }
+    )
+    return metrics
+
+
+def _benchmark_triton_variant(prepared, data, x, y, alpha, beta, warmup, iters, variant, out_dtype=None):
     x_in = x.contiguous()
     y_in = y.contiguous()
     data_in = data.contiguous() if data is not None else None
@@ -127,6 +177,7 @@ def _benchmark_triton_variant(prepared, data, x, y, alpha, beta, warmup, iters, 
         out=None,
         allow_fallback=False,
         variant=variant,
+        out_dtype=out_dtype,
     )
     torch.cuda.synchronize()
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
@@ -141,9 +192,10 @@ def _benchmark_triton_variant(prepared, data, x, y, alpha, beta, warmup, iters, 
         out=None,
         allow_fallback=False,
         variant=variant,
+        out_dtype=out_dtype,
     )[0]
     triton_values, triton_ms = ast_ops._benchmark_cuda_op(op, warmup=warmup, iters=iters)
-    return triton_values, triton_ms, first_call_ms, meta, out_first
+    return triton_values, triton_ms, first_call_ms, meta
 
 
 def _benchmark_reference_bundle(indices, indptr, x, y, data, alpha, beta, warmup, iters, run_cupy):
@@ -191,6 +243,60 @@ def _benchmark_reference_bundle(indices, indptr, x, y, data, alpha, beta, warmup
     return result
 
 
+def _build_oracle_bundle(prepared, indices, indptr, data, x, y, alpha, beta, warmup, iters, run_cupy):
+    data64 = data.to(torch.float64)
+    x64 = x.to(torch.float64)
+    y64 = y.to(torch.float64)
+    ref_bundle_f64 = _benchmark_reference_bundle(
+        indices=indices,
+        indptr=indptr,
+        x=x64,
+        y=y64,
+        data=data64,
+        alpha=alpha,
+        beta=beta,
+        warmup=warmup,
+        iters=iters,
+        run_cupy=run_cupy,
+    )
+    oracle = {
+        "source": "triton_f64",
+        "values_f64": None,
+        "values_f32": None,
+        "triton_ms": None,
+        "triton_first_call_ms": None,
+        "meta": None,
+        "pytorch_ms": ref_bundle_f64["pytorch_ms"],
+        "cupy_ms": ref_bundle_f64["cupy_ms"],
+        "cu_status": ref_bundle_f64["cu_status"],
+        "cu_reason": ref_bundle_f64["cu_reason"],
+        "ref_bundle_f64": ref_bundle_f64,
+    }
+    try:
+        values_f64, triton_ms, first_call_ms, meta = _benchmark_triton_variant(
+            prepared=prepared,
+            data=data64,
+            x=x64,
+            y=y64,
+            alpha=alpha,
+            beta=beta,
+            warmup=warmup,
+            iters=iters,
+            variant="baseline",
+            out_dtype=torch.float64,
+        )
+        oracle["values_f64"] = values_f64
+        oracle["values_f32"] = values_f64.to(torch.float32)
+        oracle["triton_ms"] = triton_ms
+        oracle["triton_first_call_ms"] = first_call_ms
+        oracle["meta"] = meta
+    except Exception:
+        oracle["source"] = "pytorch_f64_ref"
+        oracle["values_f64"] = ref_bundle_f64["ref"]
+        oracle["values_f32"] = ref_bundle_f64["ref"].to(torch.float32)
+    return oracle
+
+
 def _make_result_row(mtx_path, shape, nnz, k_dim, alpha, beta, dtype, variant, seed):
     return {
         "matrix": os.path.basename(mtx_path),
@@ -211,6 +317,8 @@ def _make_result_row(mtx_path, shape, nnz, k_dim, alpha, beta, dtype, variant, s
         "cupy_ms": None,
         "err_pt": None,
         "err_cu": None,
+        "err_oracle_f32": None,
+        "err_oracle_f64": None,
         "triton_ok_pt": None,
         "triton_ok_cu": None,
         "status": "UNKNOWN",
@@ -222,28 +330,134 @@ def _make_result_row(mtx_path, shape, nnz, k_dim, alpha, beta, dtype, variant, s
         "cu_reason": None,
         "seed": "" if seed is None else int(seed),
         "acc_dtype": None,
+        "out_dtype": None,
+        "oracle_source": None,
+        "reference_mode": "pt+oracle",
+        "max_abs_err_pt": None,
+        "mean_abs_err_pt": None,
+        "p99_scaled_err_pt": None,
+        "mismatch_rate_pt": None,
+        "max_abs_err_oracle": None,
+        "mean_abs_err_oracle": None,
+        "p99_scaled_err_oracle": None,
+        "mismatch_rate_oracle": None,
+        "max_abs_err_oracle_f64": None,
+        "mean_abs_err_oracle_f64": None,
+        "p99_scaled_err_oracle_f64": None,
+        "mismatch_rate_oracle_f64": None,
     }
 
 
-def _populate_match_fields(row, triton_values, ref_bundle, value_dtype):
-    atol, rtol = ast_ops._tolerance_for_dtype(value_dtype)
-    ref = ref_bundle["ref"]
-    row["triton_ok_pt"] = bool(torch.allclose(triton_values, ref, atol=atol, rtol=rtol))
-    row["err_pt"] = _scaled_allclose_error(triton_values, ref, value_dtype)
-    row["pytorch_ms"] = ref_bundle["pytorch_ms"]
-    row["status"] = "PASS" if row["triton_ok_pt"] else "FAIL"
+def _attach_metrics(row, prefix, metrics, err_field, ok_field=None, status_field=None):
+    row[err_field] = metrics["scaled_max"]
+    row[f"max_abs_err_{prefix}"] = metrics["max_abs"]
+    row[f"mean_abs_err_{prefix}"] = metrics["mean_abs"]
+    row[f"p99_scaled_err_{prefix}"] = metrics["p99_scaled"]
+    row[f"mismatch_rate_{prefix}"] = metrics["mismatch_rate"]
+    if ok_field is not None:
+        row[ok_field] = metrics["ok"]
+    if status_field is not None:
+        row[status_field] = "PASS" if metrics["ok"] else "FAIL"
 
-    cu_vals = ref_bundle["cupy_values"]
-    row["cupy_ms"] = ref_bundle["cupy_ms"]
-    row["cu_reason"] = ref_bundle["cu_reason"]
+
+def _populate_row_metrics(row, triton_values, ref_bundle_f32, oracle_bundle):
+    row["pytorch_ms"] = ref_bundle_f32["pytorch_ms"]
+    row["cupy_ms"] = ref_bundle_f32["cupy_ms"]
+    row["cu_reason"] = ref_bundle_f32["cu_reason"]
+    row["oracle_source"] = oracle_bundle["source"]
+
+    pt_metrics = _compute_metrics(
+        triton_values,
+        ref_bundle_f32["ref"],
+        tolerance_dtype=torch.float32,
+        compare_dtype=torch.float32,
+    )
+    _attach_metrics(row, "pt", pt_metrics, "err_pt", ok_field="triton_ok_pt", status_field="status")
+
+    cu_vals = ref_bundle_f32["cupy_values"]
     if cu_vals is None:
-        row["cu_status"] = ref_bundle["cu_status"]
+        row["cu_status"] = ref_bundle_f32["cu_status"]
         row["triton_ok_cu"] = None
         row["err_cu"] = None
-        return
-    row["triton_ok_cu"] = bool(torch.allclose(triton_values, cu_vals, atol=atol, rtol=rtol))
-    row["err_cu"] = _scaled_allclose_error(triton_values, cu_vals, value_dtype)
-    row["cu_status"] = "PASS" if row["triton_ok_cu"] else "FAIL"
+    else:
+        cu_metrics = _compute_metrics(
+            triton_values,
+            cu_vals,
+            tolerance_dtype=torch.float32,
+            compare_dtype=torch.float32,
+        )
+        row["triton_ok_cu"] = cu_metrics["ok"]
+        row["err_cu"] = cu_metrics["scaled_max"]
+        row["cu_status"] = "PASS" if cu_metrics["ok"] else "FAIL"
+
+    oracle_f32_metrics = _compute_metrics(
+        triton_values,
+        oracle_bundle["values_f32"],
+        tolerance_dtype=torch.float32,
+        compare_dtype=torch.float32,
+    )
+    _attach_metrics(row, "oracle", oracle_f32_metrics, "err_oracle_f32")
+
+    oracle_f64_metrics = _compute_metrics(
+        triton_values,
+        oracle_bundle["values_f64"],
+        tolerance_dtype=torch.float64,
+        compare_dtype=torch.float64,
+    )
+    row["err_oracle_f64"] = oracle_f64_metrics["scaled_max"]
+    row["max_abs_err_oracle_f64"] = oracle_f64_metrics["max_abs"]
+    row["mean_abs_err_oracle_f64"] = oracle_f64_metrics["mean_abs"]
+    row["p99_scaled_err_oracle_f64"] = oracle_f64_metrics["p99_scaled"]
+    row["mismatch_rate_oracle_f64"] = oracle_f64_metrics["mismatch_rate"]
+
+
+def _make_oracle_row(mtx_path, base, k_dim, alpha, beta, prepare_ms, seed, oracle_bundle):
+    row = _make_result_row(
+        mtx_path=mtx_path,
+        shape=base["shape"],
+        nnz=base["nnz"],
+        k_dim=k_dim,
+        alpha=alpha,
+        beta=beta,
+        dtype=torch.float64,
+        variant="f64_ref",
+        seed=seed,
+    )
+    row["prepare_ms"] = prepare_ms
+    row["oracle_source"] = oracle_bundle["source"]
+    row["reference_mode"] = "oracle_f64_self"
+    row["pytorch_ms"] = oracle_bundle["pytorch_ms"]
+    row["cupy_ms"] = oracle_bundle["cupy_ms"]
+    row["cu_reason"] = oracle_bundle["cu_reason"]
+    row["triton_ms"] = oracle_bundle["triton_ms"]
+    row["triton_first_call_ms"] = oracle_bundle["triton_first_call_ms"]
+    row["status"] = "PASS"
+    row["triton_ok_pt"] = True
+    row["triton_ok_cu"] = True if oracle_bundle["cu_status"] == "READY" else None
+    row["cu_status"] = "PASS" if oracle_bundle["cu_status"] == "READY" else oracle_bundle["cu_status"]
+    row["err_pt"] = 0.0
+    row["err_cu"] = 0.0 if oracle_bundle["cu_status"] == "READY" else None
+    row["err_oracle_f32"] = 0.0
+    row["err_oracle_f64"] = 0.0
+    row["max_abs_err_pt"] = 0.0
+    row["mean_abs_err_pt"] = 0.0
+    row["p99_scaled_err_pt"] = 0.0
+    row["mismatch_rate_pt"] = 0.0
+    row["max_abs_err_oracle"] = 0.0
+    row["mean_abs_err_oracle"] = 0.0
+    row["p99_scaled_err_oracle"] = 0.0
+    row["mismatch_rate_oracle"] = 0.0
+    row["max_abs_err_oracle_f64"] = 0.0
+    row["mean_abs_err_oracle_f64"] = 0.0
+    row["p99_scaled_err_oracle_f64"] = 0.0
+    row["mismatch_rate_oracle_f64"] = 0.0
+    row["fallback_used"] = False
+    meta = oracle_bundle["meta"] or {}
+    row["block_k"] = meta.get("block_k")
+    row["num_warps"] = meta.get("num_warps")
+    row["acc_dtype"] = meta.get("acc_dtype", "float64")
+    row["out_dtype"] = meta.get("out_dtype", "float64")
+    return row
 
 
 def run_one_mtx_diag(
@@ -258,7 +472,7 @@ def run_one_mtx_diag(
     seed=None,
     include_f64_ref=False,
 ):
-    base = _build_case_inputs(mtx_path, k_dim=k_dim, alpha=alpha, beta=beta, seed=seed)
+    base = _build_case_inputs(mtx_path, k_dim=k_dim, seed=seed)
     prepared, prepare_ms = _prepare_pattern(base["indices"], base["indptr"], base["shape"], k_dim)
     ref_bundle_f32 = _benchmark_reference_bundle(
         indices=base["indices"],
@@ -266,6 +480,19 @@ def run_one_mtx_diag(
         x=base["x"],
         y=base["y"],
         data=base["data"],
+        alpha=alpha,
+        beta=beta,
+        warmup=warmup,
+        iters=iters,
+        run_cupy=run_cupy,
+    )
+    oracle_bundle = _build_oracle_bundle(
+        prepared=prepared,
+        indices=base["indices"],
+        indptr=base["indptr"],
+        data=base["data"],
+        x=base["x"],
+        y=base["y"],
         alpha=alpha,
         beta=beta,
         warmup=warmup,
@@ -288,7 +515,7 @@ def run_one_mtx_diag(
         )
         row["prepare_ms"] = prepare_ms
         try:
-            triton_values, triton_ms, first_call_ms, meta, _out_first = _benchmark_triton_variant(
+            triton_values, triton_ms, first_call_ms, meta = _benchmark_triton_variant(
                 prepared=prepared,
                 data=base["data"],
                 x=base["x"],
@@ -298,6 +525,7 @@ def run_one_mtx_diag(
                 warmup=warmup,
                 iters=iters,
                 variant=variant,
+                out_dtype=None,
             )
             row["triton_ms"] = triton_ms
             row["triton_first_call_ms"] = first_call_ms
@@ -305,71 +533,31 @@ def run_one_mtx_diag(
             row["block_k"] = meta.get("block_k")
             row["num_warps"] = meta.get("num_warps")
             row["acc_dtype"] = meta.get("acc_dtype")
-            _populate_match_fields(row, triton_values, ref_bundle_f32, torch.float32)
+            row["out_dtype"] = meta.get("out_dtype", _dtype_name(triton_values.dtype))
+            _populate_row_metrics(row, triton_values, ref_bundle_f32, oracle_bundle)
         except Exception as exc:
             row["error"] = f"triton: {exc}"
             row["status"] = "TRITON_FAIL"
-            row["cu_status"] = ref_bundle_f32.get("cu_status", "REF_UNAVAILABLE")
             row["pytorch_ms"] = ref_bundle_f32.get("pytorch_ms")
             row["cupy_ms"] = ref_bundle_f32.get("cupy_ms")
+            row["cu_status"] = ref_bundle_f32.get("cu_status", "REF_UNAVAILABLE")
             row["cu_reason"] = ref_bundle_f32.get("cu_reason")
+            row["oracle_source"] = oracle_bundle["source"]
         rows.append(row)
 
     if include_f64_ref:
-        data64 = base["data"].to(torch.float64)
-        x64 = base["x"].to(torch.float64)
-        y64 = base["y"].to(torch.float64)
-        ref_bundle_f64 = _benchmark_reference_bundle(
-            indices=base["indices"],
-            indptr=base["indptr"],
-            x=x64,
-            y=y64,
-            data=data64,
-            alpha=alpha,
-            beta=beta,
-            warmup=warmup,
-            iters=iters,
-            run_cupy=run_cupy,
-        )
-        row = _make_result_row(
-            mtx_path=mtx_path,
-            shape=base["shape"],
-            nnz=base["nnz"],
-            k_dim=k_dim,
-            alpha=alpha,
-            beta=beta,
-            dtype=torch.float64,
-            variant="f64_ref",
-            seed=seed,
-        )
-        row["prepare_ms"] = prepare_ms
-        try:
-            triton_values, triton_ms, first_call_ms, meta, _out_first = _benchmark_triton_variant(
-                prepared=prepared,
-                data=data64,
-                x=x64,
-                y=y64,
+        rows.append(
+            _make_oracle_row(
+                mtx_path=mtx_path,
+                base=base,
+                k_dim=k_dim,
                 alpha=alpha,
                 beta=beta,
-                warmup=warmup,
-                iters=iters,
-                variant="baseline",
+                prepare_ms=prepare_ms,
+                seed=seed,
+                oracle_bundle=oracle_bundle,
             )
-            row["triton_ms"] = triton_ms
-            row["triton_first_call_ms"] = first_call_ms
-            row["fallback_used"] = bool(meta.get("fallback_used", False))
-            row["block_k"] = meta.get("block_k")
-            row["num_warps"] = meta.get("num_warps")
-            row["acc_dtype"] = meta.get("acc_dtype")
-            _populate_match_fields(row, triton_values, ref_bundle_f64, torch.float64)
-        except Exception as exc:
-            row["error"] = f"triton: {exc}"
-            row["status"] = "TRITON_FAIL"
-            row["cu_status"] = ref_bundle_f64.get("cu_status", "REF_UNAVAILABLE")
-            row["pytorch_ms"] = ref_bundle_f64.get("pytorch_ms")
-            row["cupy_ms"] = ref_bundle_f64.get("cupy_ms")
-            row["cu_reason"] = ref_bundle_f64.get("cu_reason")
-        rows.append(row)
+        )
 
     return rows
 
@@ -411,10 +599,10 @@ def run_mtx_batch_diag(
 def _print_case_rows(rows):
     for row in rows:
         print(
-            f"{row['matrix'][:26]:<26} {row['variant']:<10} {row['dtype']:<8} "
-            f"{row['k']:>5} {_fmt_ms(row.get('triton_ms')):>12} {_fmt_ms(row.get('pytorch_ms')):>12} "
-            f"{_fmt_ms(row.get('cupy_ms')):>12} {_fmt_check(row.get('triton_ok_pt')):>8} "
-            f"{str(row.get('cu_status')):>12} {_fmt_err(row.get('err_pt')):>10} {_fmt_err(row.get('err_cu')):>10}"
+            f"{row['matrix'][:22]:<22} {row['variant']:<12} {row['acc_dtype'] or 'N/A':<8} {row['out_dtype'] or 'N/A':<8} "
+            f"{row['k']:>5} {_fmt_ms(row.get('triton_ms')):>11} {_fmt_err(row.get('err_pt')):>10} "
+            f"{_fmt_err(row.get('err_oracle_f32')):>12} {_fmt_err(row.get('err_oracle_f64')):>12} "
+            f"{_fmt_check(row.get('triton_ok_pt')):>6} {str(row.get('cu_status')):>12}"
         )
         if row.get("error"):
             print(f"  NOTE: {str(row['error']).replace(chr(10), ' ')}")
@@ -422,26 +610,59 @@ def _print_case_rows(rows):
             print(f"  CU_NOTE: {str(row['cu_reason']).replace(chr(10), ' ')}")
 
 
-def _print_summary(rows):
-    print("-" * 132)
+def _summary_oracle_metrics(row):
+    if row.get("out_dtype") == "float64":
+        return {
+            "err": row.get("err_oracle_f64"),
+            "mismatch": row.get("mismatch_rate_oracle_f64"),
+            "p99": row.get("p99_scaled_err_oracle_f64"),
+        }
+    return {
+        "err": row.get("err_oracle_f32"),
+        "mismatch": row.get("mismatch_rate_oracle"),
+        "p99": row.get("p99_scaled_err_oracle"),
+    }
+
+
+def _print_summary(rows, oracle_only_summary=False):
+    print("-" * 148)
     print("按变体汇总")
-    print("-" * 132)
+    print("-" * 148)
     grouped = defaultdict(list)
     for row in rows:
         grouped[row["variant"]].append(row)
     for variant in sorted(grouped):
         items = grouped[variant]
         pass_count = sum(1 for row in items if row.get("status") == "PASS")
-        fail_count = sum(1 for row in items if row.get("status") not in ("PASS",))
         valid_ms = [row["triton_ms"] for row in items if row.get("triton_ms") is not None]
-        valid_err = [row["err_pt"] for row in items if row.get("err_pt") is not None]
+        oracle_errs = []
+        oracle_mismatch = []
+        oracle_p99 = []
+        for row in items:
+            metrics = _summary_oracle_metrics(row)
+            if metrics["err"] is not None:
+                oracle_errs.append(metrics["err"])
+            if metrics["mismatch"] is not None:
+                oracle_mismatch.append(metrics["mismatch"])
+            if metrics["p99"] is not None:
+                oracle_p99.append(metrics["p99"])
         avg_ms = sum(valid_ms) / len(valid_ms) if valid_ms else None
-        max_err = max(valid_err) if valid_err else None
-        print(
-            f"{variant:<10} total={len(items):>4}  pass={pass_count:>4}  fail={fail_count:>4}  "
-            f"avg_triton_ms={_fmt_ms(avg_ms):>10}  max_err_pt={_fmt_err(max_err):>10}"
-        )
-    print("-" * 132)
+        avg_err = sum(oracle_errs) / len(oracle_errs) if oracle_errs else None
+        avg_mismatch = sum(oracle_mismatch) / len(oracle_mismatch) if oracle_mismatch else None
+        max_p99 = max(oracle_p99) if oracle_p99 else None
+        if oracle_only_summary:
+            print(
+                f"{variant:<12} avg_triton_ms={_fmt_ms(avg_ms):>10}  avg_err_oracle={_fmt_err(avg_err):>10}  "
+                f"avg_mismatch_rate={avg_mismatch if avg_mismatch is not None else float('nan'):.4f}  "
+                f"max_p99_scaled={_fmt_err(max_p99):>10}"
+            )
+        else:
+            print(
+                f"{variant:<12} pass={pass_count:>4}/{len(items):<4}  avg_triton_ms={_fmt_ms(avg_ms):>10}  "
+                f"avg_err_oracle_f32={_fmt_err(avg_err):>10}  avg_mismatch_rate_oracle={avg_mismatch if avg_mismatch is not None else float('nan'):.4f}  "
+                f"max_p99_scaled_err_oracle={_fmt_err(max_p99):>10}"
+            )
+    print("-" * 148)
 
 
 def _write_csv(rows, csv_path):
@@ -456,6 +677,7 @@ def _write_csv(rows, csv_path):
         "k",
         "dtype",
         "variant",
+        "reference_mode",
         "alpha",
         "beta",
         "triton_ms",
@@ -465,6 +687,8 @@ def _write_csv(rows, csv_path):
         "cupy_ms",
         "err_pt",
         "err_cu",
+        "err_oracle_f32",
+        "err_oracle_f64",
         "triton_ok_pt",
         "triton_ok_cu",
         "status",
@@ -473,6 +697,20 @@ def _write_csv(rows, csv_path):
         "block_k",
         "num_warps",
         "acc_dtype",
+        "out_dtype",
+        "oracle_source",
+        "max_abs_err_pt",
+        "mean_abs_err_pt",
+        "p99_scaled_err_pt",
+        "mismatch_rate_pt",
+        "max_abs_err_oracle",
+        "mean_abs_err_oracle",
+        "p99_scaled_err_oracle",
+        "mismatch_rate_oracle",
+        "max_abs_err_oracle_f64",
+        "mean_abs_err_oracle_f64",
+        "p99_scaled_err_oracle_f64",
+        "mismatch_rate_oracle_f64",
         "seed",
         "error",
         "cu_reason",
@@ -493,10 +731,11 @@ def main():
     parser.add_argument("--iters", type=int, default=DEFAULT_ITERS)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0)
-    parser.add_argument("--variants", type=str, default="baseline,acc64,altreduce")
+    parser.add_argument("--variants", type=str, default="baseline,acc64,acc64_out64,altreduce")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument("--include-f64-ref", action="store_true")
+    parser.add_argument("--oracle-only-summary", action="store_true")
     parser.add_argument("--no-cupy-ref", action="store_true", help="Skip CuPy sampled-dot reference baseline")
     parser.add_argument(
         "--no-cusparse",
@@ -530,9 +769,9 @@ def main():
         print("No .mtx files found. Specify files or a directory.")
         return
 
-    print("=" * 132)
-    print("FLAGSPARSE SDDMM - float32 diagnostic variants")
-    print("=" * 132)
+    print("=" * 148)
+    print("FLAGSPARSE SDDMM - float32 diagnostic variants with float64 oracle")
+    print("=" * 148)
     print(
         f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  "
         f"K: {args.k}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  variants: {','.join(variants)}"
@@ -540,14 +779,13 @@ def main():
     if args.seed is not None:
         print(f"Seed base: {args.seed}")
     if args.include_f64_ref:
-        print("Extra row: enabled float64 reference variant (f64_ref)")
-    print("-" * 132)
+        print("Extra row: enabled float64 oracle row (f64_ref)")
+    print("-" * 148)
     print(
-        f"{'Matrix':<26} {'Variant':<10} {'DType':<8} {'K':>5} "
-        f"{'Triton(ms)':>12} {'PyTorch(ms)':>12} {'CuPy(ms)':>12} {'PT':>8} {'CU_Status':>12} "
-        f"{'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{'Matrix':<22} {'Variant':<12} {'Acc':<8} {'Out':<8} {'K':>5} "
+        f"{'Triton(ms)':>11} {'Err(PT)':>10} {'Err(OrF32)':>12} {'Err(OrF64)':>12} {'PT':>6} {'CU_Status':>12}"
     )
-    print("-" * 132)
+    print("-" * 148)
 
     rows = run_mtx_batch_diag(
         mtx_paths=paths,
@@ -562,7 +800,7 @@ def main():
         include_f64_ref=args.include_f64_ref,
         on_rows=_print_case_rows,
     )
-    _print_summary(rows)
+    _print_summary(rows, oracle_only_summary=args.oracle_only_summary)
 
     if args.csv is not None:
         _write_csv(rows, args.csv)
@@ -570,4 +808,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
